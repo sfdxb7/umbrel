@@ -1,5 +1,5 @@
 diff --git a/packages/ui/public/locales/en.json b/packages/ui/public/locales/en.json
-index 41c8713..c91d150 100644
+index 41c8713..733e891 100644
 --- a/packages/ui/public/locales/en.json
 +++ b/packages/ui/public/locales/en.json
 @@ -2796,5 +2796,37 @@
@@ -20,8 +20,8 @@ index 41c8713..c91d150 100644
 +  "remote-domain.base-domain-suggested": "Suggested from the address you're using: {{domain}}. Check it, then turn the mode on and save.",
 +  "remote-domain.advanced": "Advanced",
 +  "remote-domain.advanced-description": "The defaults are fine for most setups. Only change these if your reverse proxy or DNS uses different names.",
-+  "remote-domain.origin-rewrite-disabled": "Send the original Origin header to these apps",
-+  "remote-domain.origin-rewrite-disabled-help": "By default, requests on an app's remote host reach the app with the Origin and Referer it sees on your local network (for example http://umbrel.local:3015), so apps that check them keep working. List app ids here, separated by commas, to turn that off for them.",
++  "remote-domain.origin-rewrite-disabled": "Send the original Host and Origin headers to these apps",
++  "remote-domain.origin-rewrite-disabled-help": "By default, requests on an app's remote host reach the app with the Host, Origin and Referer it sees on your local network (for example http://umbrel.local:3015), so apps that check them keep working. List app ids here, separated by commas, to turn that off for them, for example for apps that compare Origin with X-Forwarded-Host.",
 +  "remote-domain.dashboard-subdomain": "Dashboard subdomain",
 +  "remote-domain.auth-subdomain": "App login subdomain",
 +  "remote-domain.app-subdomain-template": "App subdomain pattern ({app} is the app id)",
@@ -834,10 +834,10 @@ index 89225ba..233359f 100644
  			{
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
 new file mode 100644
-index 0000000..24a27f2
+index 0000000..082f546
 --- /dev/null
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,508 @@
 +import http from 'node:http'
 +import net from 'node:net'
 +import {once} from 'node:events'
@@ -967,15 +967,18 @@ index 0000000..24a27f2
 +			server.close(() => resolve())
 +		})
 +
-+	// Upstream app that echoes the headers it received, for HTTP and upgrades.
-+	async function startUpstream() {
++	// Upstream app that records the headers it received, for HTTP and upgrades.
++	// `allow` models the app's own origin check.
++	async function startUpstream({allow = (_headers: http.IncomingHttpHeaders): boolean => true} = {}) {
 +		const seen: http.IncomingHttpHeaders[] = []
 +		const upstream = http.createServer((request, response) => {
 +			seen.push(request.headers)
++			if (!allow(request.headers)) return response.writeHead(403).end('cross_origin')
 +			response.end('ok')
 +		})
 +		upstream.on('upgrade', (request, socket) => {
 +			seen.push(request.headers)
++			if (!allow(request.headers)) return socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
 +			socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
 +		})
 +		upstream.listen(0, '127.0.0.1')
@@ -1022,14 +1025,37 @@ index 0000000..24a27f2
 +		...extra,
 +	})
 +
-+	function get(port: number, headers: Record<string, string>) {
-+		return new Promise<void>((resolve, reject) => {
++	function get(port: number, headers: Record<string, string>, method = 'GET') {
++		return new Promise<http.IncomingMessage>((resolve, reject) => {
 +			http
-+				.get({host: '127.0.0.1', port, path: '/api/chat?x=1', headers}, (response) => {
++				.request({host: '127.0.0.1', port, method, path: '/api/chat?x=1', headers}, (response) => {
 +					response.resume()
-+					response.on('end', resolve)
++					response.on('end', () => resolve(response))
 +				})
 +				.on('error', reject)
++				.end()
++		})
++	}
++
++	// Resolves with 101 for a completed upgrade, or the status of a refusal.
++	function upgradeStatus(port: number, headers: Record<string, string>) {
++		return new Promise<number>((resolve, reject) => {
++			const request = http.request({
++				host: '127.0.0.1',
++				port,
++				path: '/ws',
++				headers: {...headers, connection: 'Upgrade', upgrade: 'websocket'},
++			})
++			request.on('upgrade', (_response, socket) => {
++				socket.destroy()
++				resolve(101)
++			})
++			request.on('response', (response) => {
++				response.resume()
++				resolve(response.statusCode!)
++			})
++			request.on('error', reject)
++			request.end()
 +		})
 +	}
 +
@@ -1056,6 +1082,7 @@ index 0000000..24a27f2
 +		const port = await startGateway(upstream.port, () => remote)
 +		await get(port, remoteHeaders({origin: `https://${remoteHost}`, referer: `https://${remoteHost}/chat/1?tab=files`}))
 +		expect(upstream.seen[0]).toMatchObject({
++			host: 'umbrel.local:3015',
 +			origin: 'http://umbrel.local:3015',
 +			referer: 'http://umbrel.local:3015/chat/1?tab=files',
 +			'x-forwarded-host': remoteHost,
@@ -1068,6 +1095,7 @@ index 0000000..24a27f2
 +		const port = await startGateway(upstream.port, () => remote)
 +		await upgrade(port, remoteHeaders({origin: `https://${remoteHost}`}))
 +		expect(upstream.seen[0]).toMatchObject({
++			host: 'umbrel.local:3015',
 +			origin: 'http://umbrel.local:3015',
 +			'x-forwarded-host': remoteHost,
 +			'x-forwarded-proto': 'https',
@@ -1100,7 +1128,7 @@ index 0000000..24a27f2
 +			'x-forwarded-proto': 'http',
 +			origin: `https://${remoteHost}`,
 +		})
-+		expect(upstream.seen[0].origin).toBe(`https://${remoteHost}`)
++		expect(upstream.seen[0]).toMatchObject({host: 'umbrel.local:3015', origin: `https://${remoteHost}`})
 +
 +		const optedOut = resolveRemoteDomain({
 +			enabled: true,
@@ -1109,7 +1137,126 @@ index 0000000..24a27f2
 +		})!
 +		const optedOutPort = await startGateway(upstream.port, () => optedOut)
 +		await get(optedOutPort, remoteHeaders({origin: `https://${remoteHost}`}))
-+		expect(upstream.seen[1]).toMatchObject({origin: `https://${remoteHost}`, 'x-forwarded-host': remoteHost})
++		expect(upstream.seen[1]).toMatchObject({
++			host: remoteHost,
++			origin: `https://${remoteHost}`,
++			'x-forwarded-host': remoteHost,
++		})
++	})
++
++	// A common same-host CSRF guard: the Origin host must equal Host or X-Forwarded-Host.
++	const sameHostOrigin = (headers: http.IncomingHttpHeaders) => {
++		if (!headers.origin) return true
++		const originHost = new URL(headers.origin).host
++		return originHost === headers.host || originHost === headers['x-forwarded-host']
++	}
++
++	test('passes apps that require the Origin host to match Host or X-Forwarded-Host', async () => {
++		const upstream = await startUpstream({allow: sameHostOrigin})
++		const port = await startGateway(upstream.port, () => remote)
++		const origin = `https://${remoteHost}`
++		expect((await get(port, remoteHeaders({origin}), 'POST')).statusCode).toBe(200)
++		expect(await upgradeStatus(port, remoteHeaders({origin}))).toBe(101)
++		// Cross-site requests are still refused by the app
++		expect((await get(port, remoteHeaders({origin: 'https://evil.com'}), 'POST')).statusCode).toBe(403)
++		expect(await upgradeStatus(port, remoteHeaders({origin: 'https://immich-umbrel.example.com'}))).toBe(403)
++	})
++
++	// Agent Zero and many others compare Origin with a LAN allowlist built from
++	// DEVICE_DOMAIN_NAME, which is why the gateway presents the LAN origin.
++	test('still passes apps that only allow their LAN origins', async () => {
++		const lanAllowlist = (headers: http.IncomingHttpHeaders) =>
++			['http://umbrel.local:3015', 'http://localhost:3015'].includes(String(headers.origin))
++		const upstream = await startUpstream({allow: lanAllowlist})
++		const port = await startGateway(upstream.port, () => remote)
++		expect((await get(port, remoteHeaders({origin: `https://${remoteHost}`}), 'POST')).statusCode).toBe(200)
++		expect(await upgradeStatus(port, remoteHeaders({origin: `https://${remoteHost}`}))).toBe(101)
++		expect((await get(port, remoteHeaders({origin: 'https://evil.com'}), 'POST')).statusCode).toBe(403)
++	})
++
++	// Upstream app configured with a LAN URL, e.g. APP_URL=http://umbrel.local:7455.
++	// The test passes the response headers it wants; PORT is the upstream port.
++	async function startRedirectingUpstream() {
++		const upstream = http.createServer((request, response) => {
++			const port = String((upstream.address() as net.AddressInfo).port)
++			const headers = JSON.parse(String(request.headers['x-test-response'])) as Record<string, string | string[]>
++			const resolved = JSON.parse(JSON.stringify(headers).replaceAll('PORT', port))
++			response.writeHead(302, resolved).end()
++		})
++		upstream.listen(0, '127.0.0.1')
++		await once(upstream, 'listening')
++		closers.push(close(upstream))
++		return (upstream.address() as net.AddressInfo).port
++	}
++
++	const respondWith = (headers: Record<string, string | string[]>) => ({'x-test-response': JSON.stringify(headers)})
++
++	test('points redirects to the app local address at its remote origin', async () => {
++		const upstreamPort = await startRedirectingUpstream()
++		const port = await startGateway(upstreamPort, () => remote)
++		const cases = [
++			['http://umbrel.local:3015/signin?callbackUrl=%2Fchat', `https://${remoteHost}/signin?callbackUrl=%2Fchat`],
++			['http://UMBREL:3015/', `https://${remoteHost}/`],
++			['http://192.168.1.10:3015/x', `https://${remoteHost}/x`],
++			['https://localhost:3015/x#y', `https://${remoteHost}/x#y`],
++			['//umbrel.local:3015/x', `https://${remoteHost}/x`],
++			['http://agent-zero_web_1:PORT/x?y=1', `https://${remoteHost}/x?y=1`],
++			['http://127.0.0.1:PORT/x', `https://${remoteHost}/x`],
++			// Other apps, foreign hosts and relative URLs are left alone
++			['http://umbrel.local:2000/login', 'http://umbrel.local:2000/login'],
++			['http://umbrel.local:PORT/login', `http://umbrel.local:${upstreamPort}/login`],
++			['https://evil.com/x', 'https://evil.com/x'],
++			['/signin?x=1', '/signin?x=1'],
++		]
++		for (const [location, expected] of cases) {
++			const response = await get(port, remoteHeaders(respondWith({location: location!})))
++			expect(response.headers.location).toBe(expected)
++		}
++	})
++
++	test('rewrites Refresh and drops LAN cookie domains on the remote host', async () => {
++		const upstreamPort = await startRedirectingUpstream()
++		const port = await startGateway(upstreamPort, () => remote)
++		const response = await get(
++			port,
++			remoteHeaders(
++				respondWith({
++					refresh: '0; url=http://umbrel.local:3015/signin',
++					'set-cookie': [
++						'a=1; Domain=umbrel.local; Path=/; HttpOnly',
++						'b=2; Domain=example.org; Path=/',
++						'c=3; Path=/',
++					],
++				}),
++			),
++		)
++		expect(response.headers.refresh).toBe(`0; url=https://${remoteHost}/signin`)
++		expect(response.headers['set-cookie']).toEqual([
++			'a=1; Path=/; HttpOnly',
++			'b=2; Domain=example.org; Path=/',
++			'c=3; Path=/',
++		])
++	})
++
++	test('rewrites redirects for opted-out apps but never for LAN requests', async () => {
++		const upstreamPort = await startRedirectingUpstream()
++		const optedOut = resolveRemoteDomain({
++			enabled: true,
++			baseDomain: 'example.com',
++			originRewriteDisabledApps: ['agent-zero'],
++		})!
++		const optedOutPort = await startGateway(upstreamPort, () => optedOut)
++		const headers = respondWith({location: 'http://umbrel.local:3015/signin'})
++		expect((await get(optedOutPort, remoteHeaders(headers))).headers.location).toBe(`https://${remoteHost}/signin`)
++
++		const port = await startGateway(upstreamPort, () => remote)
++		const lan = await get(port, {
++			host: 'umbrel.local:3015',
++			'x-forwarded-host': 'umbrel.local:3015',
++			'x-forwarded-proto': 'http',
++			...headers,
++		})
++		expect(lan.headers.location).toBe('http://umbrel.local:3015/signin')
 +	})
 +})
 +
@@ -1200,10 +1347,10 @@ index 0000000..24a27f2
 +	})
 +})
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway.ts b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-index b799fd2..590ba34 100644
+index b799fd2..28f3908 100644
 --- a/packages/umbreld/source/modules/app-gateway/app-gateway.ts
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-@@ -18,6 +18,17 @@ import {
+@@ -18,6 +18,20 @@ import {
  } from '../auth/app-gateway-cookie.js'
  import {SESSION_DURATION} from '../auth/auth.js'
  import {appGatewayErrorPage} from './error-page.js'
@@ -1215,25 +1362,28 @@ index b799fd2..590ba34 100644
 +	remoteAppAuthUrl,
 +	remotePublicPathsAllowed,
 +	remoteOriginRewrite,
++	rewriteLocalAppUrl,
++	rewriteLocalRefresh,
 +	rewriteRemoteOriginHeaders,
++	stripLocalCookieDomain,
 +	type RemoteDomain,
 +} from '../lan-ingress/remote-domain.js'
  
  export type AppGatewayConfig = {
  	appId: string
-@@ -36,6 +47,11 @@ export type AppGatewayConfig = {
+@@ -36,6 +50,11 @@ export type AppGatewayConfig = {
  
  type AppGatewayOptions = {
  	onUpstreamUnavailable?: () => void
 +	// Read on every request so a settings change applies without restarting the gateway.
 +	getRemoteDomain?: () => RemoteDomain | undefined
 +	// The origin a LAN browser uses for this app, e.g. http://umbrel.local:3015.
-+	// Remote requests present this Origin/Referer to the app.
++	// Remote requests present this Host/Origin/Referer to the app.
 +	getLanOrigin?: () => string | undefined
  }
  
  function environmentRecord(environment: unknown) {
-@@ -127,14 +143,30 @@ export function pathMatches(pathname: string, rules: string[]) {
+@@ -127,14 +146,30 @@ export function pathMatches(pathname: string, rules: string[]) {
  	})
  }
  
@@ -1272,7 +1422,7 @@ index b799fd2..590ba34 100644
  }
  
  function hostWithPort(hostname: string, port: number) {
-@@ -146,6 +178,8 @@ export default class AppGateway {
+@@ -146,6 +181,8 @@ export default class AppGateway {
  	#umbreld: Umbreld
  	#config: AppGatewayConfig
  	#onUpstreamUnavailable?: () => void
@@ -1281,7 +1431,7 @@ index b799fd2..590ba34 100644
  	#proxy: ReturnType<typeof createProxyMiddleware>
  	server: http.Server
  
-@@ -153,6 +187,8 @@ export default class AppGateway {
+@@ -153,6 +190,8 @@ export default class AppGateway {
  		this.#umbreld = umbreld
  		this.#config = config
  		this.#onUpstreamUnavailable = options.onUpstreamUnavailable
@@ -1290,7 +1440,7 @@ index b799fd2..590ba34 100644
  		this.#proxy = this.createProxy()
  
  		const app = express()
-@@ -205,8 +241,12 @@ export default class AppGateway {
+@@ -205,8 +244,13 @@ export default class AppGateway {
  					proxyRequest.setHeader('x-forwarded-for', request.socket.remoteAddress)
  				}
  				this.stripCookies(proxyRequest, request)
@@ -1301,32 +1451,58 @@ index b799fd2..590ba34 100644
 +				this.applyRemoteHeaders(proxyRequest, request)
  			},
 -			onProxyReqWs: (proxyRequest, request) => this.stripCookies(proxyRequest, request),
++			onProxyRes: (proxyResponse, request) => this.rewriteRemoteResponse(proxyResponse, request),
  			onError: (error, _request, response) => this.handleUpstreamError(response, error),
  		})
  	}
-@@ -265,10 +305,40 @@ export default class AppGateway {
+@@ -265,10 +309,65 @@ export default class AppGateway {
  		else proxyRequest.removeHeader('cookie')
  	}
  
 +	// The proxy only runs after the request passed Umbrel app auth (or the app
 +	// has auth off and the owner allowed it on the remote domain). On the app's
 +	// own remote host, present the request to the app the way a LAN browser
-+	// would: same-app Origin/Referer become the LAN origin, and X-Forwarded-*
-+	// carry the public host and https.
++	// would: Host becomes the LAN host and a same-app Origin/Referer the LAN
++	// origin, so allowlists of LAN origins and "Origin must match Host" checks
++	// both pass. X-Forwarded-* carry the public host and https.
 +	private applyRemoteHeaders(proxyRequest: http.ClientRequest, request: http.IncomingMessage) {
-+		const rewrite = remoteOriginRewrite(
++		const rewrite = this.remoteRewrite(request)
++		if (!rewrite) return
++		proxyRequest.setHeader('x-forwarded-host', rewrite.remoteHost)
++		proxyRequest.setHeader('x-forwarded-proto', 'https')
++		if (!rewrite.lanOrigin) return
++		proxyRequest.setHeader('host', new URL(rewrite.lanOrigin).host)
++		const headers = rewriteRemoteOriginHeaders(request.headers, rewrite.remoteOrigin, rewrite.lanOrigin)
++		if (headers.origin) proxyRequest.setHeader('origin', headers.origin)
++		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
++	}
++
++	private remoteRewrite(request: http.IncomingMessage) {
++		return remoteOriginRewrite(
 +			this.#getRemoteDomain?.(),
 +			this.#config.appId,
 +			browserHost(request),
 +			this.#getLanOrigin?.(),
 +		)
++	}
++
++	// Apps configured with a LAN URL (for example APP_URL=http://umbrel.local:7455)
++	// redirect to it. On the app's remote host, point such redirects at the
++	// remote origin instead, keeping path and query. Applies to opted-out apps
++	// too, since a LAN redirect never works from the internet.
++	private rewriteRemoteResponse(proxyResponse: http.IncomingMessage, request: http.IncomingMessage) {
++		const rewrite = this.remoteRewrite(request)
 +		if (!rewrite) return
-+		proxyRequest.setHeader('x-forwarded-host', rewrite.remoteHost)
-+		proxyRequest.setHeader('x-forwarded-proto', 'https')
-+		if (!rewrite.lanOrigin) return
-+		const headers = rewriteRemoteOriginHeaders(request.headers, rewrite.remoteOrigin, rewrite.lanOrigin)
-+		if (headers.origin) proxyRequest.setHeader('origin', headers.origin)
-+		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
++		const local = {...this.#config, lanOrigin: this.#getLanOrigin?.()}
++		const {location, refresh} = proxyResponse.headers
++		if (typeof location === 'string') {
++			proxyResponse.headers.location = rewriteLocalAppUrl(location, local, rewrite.remoteOrigin)
++		}
++		if (typeof refresh === 'string') {
++			proxyResponse.headers.refresh = rewriteLocalRefresh(refresh, local, rewrite.remoteOrigin)
++		}
++		const cookies = proxyResponse.headers['set-cookie']
++		if (cookies) proxyResponse.headers['set-cookie'] = cookies.map((cookie) => stripLocalCookieDomain(cookie, local))
 +	}
 +
 +	// Manifest-declared public paths (PROXY_AUTH_WHITELIST) were designed for the
@@ -1346,7 +1522,7 @@ index b799fd2..590ba34 100644
  		const blacklisted = pathMatches(pathname, this.#config.authBlacklist)
  		if (whitelisted && !blacklisted) return
  
-@@ -295,6 +365,16 @@ export default class AppGateway {
+@@ -295,6 +394,16 @@ export default class AppGateway {
  		try {
  			await this.isAuthorized(request)
  		} catch {
@@ -2070,10 +2246,10 @@ index 65ebec6..38fd88e 100644
  	private serverPort(server: net.Server | http.Server) {
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
 new file mode 100644
-index 0000000..df31bbb
+index 0000000..bb76a90
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,421 @@
 +import net from 'node:net'
 +
 +// Opt-in "remote domain" mode: umbrelOS sits behind a TLS-terminating reverse
@@ -2091,8 +2267,8 @@ index 0000000..df31bbb
 +	// App ids whose Umbrel login is turned off, but which the owner explicitly
 +	// allows on the remote domain anyway.
 +	allowUnauthenticatedApps?: string[]
-+	// App ids that should receive the browser's original Origin and Referer
-+	// headers instead of the LAN-equivalent ones (see rewriteRemoteOriginHeaders).
++	// App ids that should receive the browser's original Host, Origin and
++	// Referer headers instead of the LAN-equivalent ones (see remoteOriginRewrite).
 +	originRewriteDisabledApps?: string[]
 +	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
 +	// public on the remote domain. Off for every app by default.
@@ -2336,10 +2512,14 @@ index 0000000..df31bbb
 +}
 +
 +// Many apps check the browser Origin against the LAN addresses Umbrel hands
-+// them (for example http://umbrel.local:3015) and reject the remote host. For a
-+// request that arrived on an app's own remote host, return the remote origin
-+// and the LAN origin it should be presented as. Returns undefined for every
-+// other host, so LAN, IP, Tor and Tailscale requests are never touched.
++// them (for example http://umbrel.local:3015) and reject the remote host.
++// Others require the Origin host to equal Host or X-Forwarded-Host. For a
++// request that arrived on an app's own remote host, the gateway presents it the
++// way a LAN browser would send it: Host becomes the LAN host and a same-app
++// Origin/Referer the LAN origin, together, so both kinds of check pass.
++// X-Forwarded-Host and X-Forwarded-Proto keep the public host and https for
++// apps that build URLs from them. Returns undefined for every other host, so
++// LAN, IP, Tor and Tailscale requests are never touched.
 +export function remoteOriginRewrite(
 +	remote: RemoteDomain | undefined,
 +	appId: string,
@@ -2388,6 +2568,96 @@ index 0000000..df31bbb
 +	return result
 +}
 +
++const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '[::]'])
++
++function isPrivateOrLoopbackIp(hostname: string) {
++	const host = hostname.replace(/^\[|\]$/g, '')
++	if (net.isIPv4(host)) {
++		const [a, b] = host.split('.').map(Number) as [number, number]
++		return (
++			a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)
++		)
++	}
++	if (net.isIPv6(host)) return host === '::1' || /^f[cd]/i.test(host) || /^fe[89ab]/i.test(host)
++	return false
++}
++
++export type LocalAppAddress = {
++	// The origin a LAN browser uses for the app, e.g. http://umbrel.local:3015.
++	lanOrigin?: string
++	// Where the gateway reaches the app, e.g. agent-zero_web_1:80.
++	targetHost: string
++	targetAddress?: string
++	targetPort: number
++}
++
++function lanNames(local: LocalAppAddress) {
++	if (!local.lanOrigin) return new Set<string>()
++	const hostname = new URL(local.lanOrigin).hostname.toLowerCase()
++	return new Set([hostname, hostname.replace(/\.local$/, '')])
++}
++
++function targetNames(local: LocalAppAddress) {
++	const names = new Set([local.targetHost.toLowerCase(), ...LOOPBACK_HOSTS])
++	if (local.targetAddress) names.add(hostWithBrackets(local.targetAddress.toLowerCase()))
++	return names
++}
++
++function hostWithBrackets(host: string) {
++	return net.isIPv6(host) ? `[${host}]` : host
++}
++
++// Whether a URL points at the app itself through one of its local addresses:
++// the LAN hostname (with or without .local), a private or loopback IP or
++// localhost on the app's LAN port, or the container host, its address,
++// loopback or the wildcard address on its internal port. The LAN hostname on
++// any other port is another app and does not match.
++export function isLocalAppUrl(url: URL, local: LocalAppAddress) {
++	if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
++	if (url.username || url.password) return false
++	const host = url.hostname.toLowerCase()
++	const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
++	const lanPort = local.lanOrigin ? Number(new URL(local.lanOrigin).port || 80) : undefined
++	if (port === lanPort && (lanNames(local).has(host) || LOOPBACK_HOSTS.has(host) || isPrivateOrLoopbackIp(host))) {
++		return true
++	}
++	return port === local.targetPort && targetNames(local).has(host)
++}
++
++// Rewrite a response URL (Location, Refresh) that points at the app's local
++// address to the same path on its remote origin. Relative and foreign URLs
++// are returned unchanged.
++export function rewriteLocalAppUrl(value: string, local: LocalAppAddress, remoteOrigin: string) {
++	if (!/^(?:https?:)?\/\//i.test(value.trim())) return value
++	let url: URL
++	try {
++		url = new URL(value.trim(), 'http://placeholder.invalid')
++	} catch {
++		return value
++	}
++	if (!isLocalAppUrl(url, local)) return value
++	return `${remoteOrigin}${url.pathname}${url.search}${url.hash}`
++}
++
++// Refresh: 0; url=http://umbrel.local:7455/signin
++export function rewriteLocalRefresh(value: string, local: LocalAppAddress, remoteOrigin: string) {
++	const match = /^(\s*[\d.]*\s*[;,]\s*url\s*=\s*)(['"]?)(.*?)\2(\s*)$/i.exec(value)
++	if (!match) return value
++	const [, prefix, quote, url, suffix] = match
++	return `${prefix}${quote}${rewriteLocalAppUrl(url!, local, remoteOrigin)}${quote}${suffix}`
++}
++
++// Drop a Set-Cookie Domain attribute that names a local hostname, so the
++// cookie becomes host-only on the remote host instead of being rejected by
++// the browser.
++export function stripLocalCookieDomain(cookie: string, local: LocalAppAddress) {
++	return cookie.replace(/;\s*domain\s*=\s*([^;]*)/gi, (attribute, domain: string) => {
++		const host = hostWithBrackets(domain.trim().toLowerCase().replace(/^\./, ''))
++		const isLocal = lanNames(local).has(host) || targetNames(local).has(host) || isPrivateOrLoopbackIp(host)
++		return isLocal ? '' : attribute
++	})
++}
++
 +// True for any request whose Host is the base domain or below it. Such
 +// requests came through the public reverse proxy (or look like they did), so
 +// they get the stricter remote behaviour. LAN, IP, mDNS, Tor and Tailscale
@@ -2403,10 +2673,10 @@ index 0000000..df31bbb
 +}
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
 new file mode 100644
-index 0000000..c417544
+index 0000000..010935d
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,393 @@
 +import {describe, expect, test} from 'vitest'
 +
 +import {
@@ -2423,6 +2693,9 @@ index 0000000..c417544
 +	remoteOriginRewrite,
 +	resolveRemoteDomain,
 +	rewriteRemoteOriginHeaders,
++	rewriteLocalAppUrl,
++	rewriteLocalRefresh,
++	stripLocalCookieDomain,
 +	validateBaseDomain,
 +	validateClientIpHeader,
 +	validateRemoteDomainSettings,
@@ -2678,6 +2951,53 @@ index 0000000..c417544
 +			originRewriteDisabledApps: ['agent-zero'],
 +		})!
 +		expect(remoteOriginRewrite(optedOut, 'agent-zero', 'agent-zero-umbrel.example.com', lan)?.lanOrigin).toBeUndefined()
++	})
++})
++
++describe('local redirect rewrite', () => {
++	const local = {lanOrigin: 'http://umbrel.local:7455', targetHost: 'lobe-chat_app_1', targetPort: 3210}
++	const remoteOrigin = 'https://lobe-chat-umbrel.example.com'
++
++	test('maps the app local addresses to its remote origin', () => {
++		for (const url of [
++			'http://umbrel.local:7455/signin?callbackUrl=%2F',
++			'https://umbrel.local:7455/signin?callbackUrl=%2F',
++			'http://umbrel:7455/signin?callbackUrl=%2F',
++			'http://10.0.0.5:7455/signin?callbackUrl=%2F',
++			'http://[::1]:7455/signin?callbackUrl=%2F',
++			'http://lobe-chat_app_1:3210/signin?callbackUrl=%2F',
++			'http://0.0.0.0:3210/signin?callbackUrl=%2F',
++		]) {
++			expect(rewriteLocalAppUrl(url, local, remoteOrigin)).toBe(`${remoteOrigin}/signin?callbackUrl=%2F`)
++		}
++	})
++
++	test('leaves other apps, public hosts, credentials and relative URLs alone', () => {
++		for (const url of [
++			'http://umbrel.local:7458/bucket',
++			'http://lobe-chat_app_1:7455/x',
++			'http://8.8.8.8:7455/x',
++			'https://evil.com/x',
++			'http://user:pass@umbrel.local:7455/x',
++			'/signin',
++			'javascript:alert(1)',
++			'http://[bad',
++		]) {
++			expect(rewriteLocalAppUrl(url, local, remoteOrigin)).toBe(url)
++		}
++	})
++
++	test('rewrites the Refresh url and keeps its delay and quotes', () => {
++		expect(rewriteLocalRefresh("5; URL='http://umbrel.local:7455/a?b=1'", local, remoteOrigin)).toBe(
++			`5; URL='${remoteOrigin}/a?b=1'`,
++		)
++		expect(rewriteLocalRefresh('5', local, remoteOrigin)).toBe('5')
++	})
++
++	test('drops only local cookie domains', () => {
++		expect(stripLocalCookieDomain('s=1; Domain=.umbrel.local; Secure', local)).toBe('s=1; Secure')
++		expect(stripLocalCookieDomain('s=1; domain=192.168.1.10', local)).toBe('s=1')
++		expect(stripLocalCookieDomain('s=1; Domain=example.com', local)).toBe('s=1; Domain=example.com')
 +	})
 +})
 +

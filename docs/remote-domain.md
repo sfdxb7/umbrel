@@ -16,7 +16,7 @@ IP, LAN (`umbrel.local`), Tor and Tailscale access is unchanged. Those still use
 
 After first boot, sign in as the owner and open **Settings → Advanced → Remote domain**:
 
-1. Enter your base domain, for example `example.com`. If no base domain has been saved and you opened the dashboard on a domain name, the field is pre-filled with a suggestion (`umbrel.example.com` → `example.com`). Check it before saving. The suggestion never turns the mode on. The dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`), the Origin rewrite opt-out, the trusted proxies and the client IP header are under **Advanced**. The defaults are fine for most setups.
+1. Enter your base domain, for example `example.com`. If no base domain has been saved and you opened the dashboard on a domain name, the field is pre-filled with a suggestion (`umbrel.example.com` → `example.com`). Check it before saving. The suggestion never turns the mode on. The dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`), the Host and Origin rewrite opt-out, the trusted proxies and the client IP header are under **Advanced**. The defaults are fine for most setups.
 2. Turn on **Enable remote domain** and save.
 3. Optional: allow individual apps that have Umbrel login turned off, or allow an app's public paths remotely (see below).
 
@@ -229,7 +229,8 @@ The settings page warns the owner when 2FA is off. Turning on 2FA for every acco
 ## Known limits
 
 - Apps without an app gateway, and non-HTTP ports, are not routed on the remote domain.
-- Upstream apps see a LAN `Origin`/`Referer` but the remote `Host`. See "Origin and Referer rewrite" below.
+- Upstream apps see a LAN `Host`/`Origin`/`Referer`. Apps that build absolute URLs in page bodies from the raw `Host` (instead of `X-Forwarded-Host`) produce LAN URLs; redirects are fixed up, page bodies are not. Use the per-app override for such apps. See "Origin and Referer rewrite" below.
+- Only the app's main port is routed. Extra ports an app hands to the browser (for example a separate S3 or gateway port) stay LAN-only.
 - Home-screen shortcuts, widgets and the MCP `get_app_details` URL still use port URLs.
 - `X-Forwarded-For` is only used to find the client address for login throttling. The secure context comes from the proxy → :443 hop being HTTPS, not from `X-Forwarded-Proto`.
 - Login throttling state is kept in memory, so it resets when umbreld restarts.
@@ -237,15 +238,23 @@ The settings page warns the owner when 2FA is off. Turning on 2FA for every acco
 
 ## Origin and Referer rewrite
 
-Some apps (for example Agent Zero on port 3015) only accept requests whose `Origin` matches the LAN URL they expect, and reject `https://agent-zero-umbrel.example.com`. For remote-domain requests that have passed Umbrel app login (or that come from an app you allowed without login), the app gateway:
+Apps check the browser `Origin` in two common ways, and both reject `https://agent-zero-umbrel.example.com` out of the box:
 
-- rewrites `Origin: https://<appId>-umbrel.<domain>` to `http://<umbrel hostname>:<app port>`. The hostname is the device hostname with `.local` added, `umbrel.local` by default. This applies to normal HTTP requests and WebSocket upgrades;
-- rewrites a `Referer` on that same origin to the LAN origin, keeping its path and query;
-- sets `X-Forwarded-Host: <appId>-umbrel.<domain>` and `X-Forwarded-Proto: https`.
+- against a list of LAN URLs Umbrel hands them, for example `http://umbrel.local:3015` (Agent Zero, Django `CSRF_TRUSTED_ORIGINS`, better-auth `AUTH_TRUSTED_ORIGINS`, SvelteKit `ORIGIN`);
+- by requiring the `Origin` host to equal `Host` or `X-Forwarded-Host` (Murmur, Agent Zero's WebSocket check, many WebSocket servers).
 
-Only an exact match on the app's own remote origin is rewritten. Foreign origins and other apps' origins reach the app unchanged, so the app's own cross-origin protection still works. Requests with no `Origin` are left alone. `Host` is **not** rewritten, so apps that build absolute URLs from `Host` keep producing remote URLs. LAN, IP and Tailscale requests are never rewritten.
+For remote-domain requests that have passed Umbrel app login (or that come from an app you allowed without login), the app gateway therefore presents the request the way a LAN browser sends it:
 
-**Per-app override.** If an app compares `Origin` with `Host` (some WebSocket servers do this by default), the rewrite makes them differ. In that case add the app ID under **Settings → Advanced → Remote domain → Advanced → Send the original Origin header to these apps**, or over tRPC: `lanIngress.setRemoteDomain({..., originRewriteDisabledApps: ["some-app"]})`. Those apps still get `X-Forwarded-Host`/`X-Forwarded-Proto`, but their `Origin` and `Referer` are passed through unchanged.
+- `Host` becomes `<umbrel hostname>:<app port>`, for example `umbrel.local:3015`. The hostname is the device hostname with `.local` added, `umbrel.local` by default;
+- `Origin: https://<appId>-umbrel.<domain>` becomes `http://<umbrel hostname>:<app port>`, for normal HTTP requests and WebSocket upgrades;
+- a `Referer` on that same origin becomes the LAN origin, keeping its path and query;
+- `X-Forwarded-Host: <appId>-umbrel.<domain>` and `X-Forwarded-Proto: https` are set, so apps that build URLs from them still produce remote URLs.
+
+`Host` and `Origin` are always rewritten together, so a same-app request passes both kinds of check. Only an exact match on the app's own remote origin is rewritten. Foreign origins and other apps' origins reach the app unchanged and still fail both checks. Requests with no `Origin` are left alone apart from `Host`. LAN, IP and Tailscale requests are never rewritten.
+
+**Redirects.** Apps configured with a LAN URL (for example `APP_URL=http://umbrel.local:7455`) redirect to it, which does not work from the internet. On an app's remote host the gateway rewrites a response `Location` or `Refresh` URL that points at the app itself to `https://<appId>-umbrel.<domain>`, keeping path and query. "The app itself" means the LAN hostname (with or without `.local`), a private or loopback IP or `localhost` on the app's LAN port, or the app container's host or address on its internal port. Relative URLs, other ports (other apps) and public hosts are left alone. A `Set-Cookie` `Domain` attribute naming a local hostname is dropped, so the cookie becomes host-only on the remote host. This also applies to apps under the per-app override.
+
+**Per-app override.** Apps that compare `Origin` with `X-Forwarded-Host` before `Host` (for example Next.js server actions and Rails), or that build page URLs from the raw `Host`, should get the browser's original headers. Add the app ID under **Settings → Advanced → Remote domain → Advanced → Send the original Host and Origin headers to these apps**, or over tRPC: `lanIngress.setRemoteDomain({..., originRewriteDisabledApps: ["some-app"]})`. Those apps get the original `Host`, `Origin` and `Referer`, plus `X-Forwarded-Host`/`X-Forwarded-Proto`. The setting keeps its `originRewriteDisabledApps` name for compatibility.
 
 ## Revision 2
 
@@ -258,7 +267,7 @@ Only an exact match on the app's own remote origin is rewritten. Foreign origins
 2. **No real domain is used.** Code, tests and docs use `example.com`, `<app>-umbrel.example.com` and `umbrel-auth.example.com`. There is no built-in default base domain any more. It is empty until you set one.
 3. **Simpler settings.** The base domain is the main field. Dashboard subdomain, auth subdomain, app template and the Origin rewrite opt-out are in a collapsed **Advanced** section, with a note that the defaults are fine for most setups.
 4. **Base domain suggestion.** When nothing is saved yet, the field is pre-filled from the address you opened the dashboard on, with the first label dropped (`umbrel.example.com` → `example.com`). You confirm it by saving. The mode is never turned on automatically. No suggestion is made for IPv4/IPv6 addresses, `localhost`, `*.local`, Tailscale `*.ts.net`, `.onion`, other private-use suffixes (`.internal`, `.lan`, `.home`, `.test`), or single-label and two-label hosts.
-5. **Origin/Referer rewrite in the app gateway** (generic, fixes Agent Zero). See "Origin and Referer rewrite" above, including the per-app `originRewriteDisabledApps` override and the `Origin`-vs-`Host` caveat.
+5. **Origin/Referer rewrite in the app gateway** (generic, fixes Agent Zero). See "Origin and Referer rewrite" above, including the per-app `originRewriteDisabledApps` override.
 
 Tests added: hostname suggestion (UI), lifecycle refresh, route-change event and uninstall removal (`lan-ingress-remote-lifecycle.unit.test.ts`), the 503 for starting apps, header rewrite helpers, and gateway integration tests. The integration tests send real HTTP and WebSocket upgrade requests to an echo upstream and cover: same-app origin rewritten, foreign/other-app origin untouched, referer path kept, no-origin untouched, LAN requests untouched, and the per-app opt-out.
 
@@ -272,3 +281,10 @@ Tests added: hostname suggestion (UI), lifecycle refresh, route-change event and
 6. **Docs.** The proxy guide is provider-neutral and includes a self-hosted Caddy or Traefik setup with a wildcard certificate over DNS-01.
 
 Tests added: the throttle policy (`login-throttle.unit.test.ts`), client IP resolution (`client-ip.unit.test.ts`), the new settings (`remote-domain.unit.test.ts`), public paths in the app gateway (`app-gateway-remote.unit.test.ts`), and HTTP-level tests for batching, enumeration, lockouts, IP spraying, app login and headers on remote and LAN hosts (`remote-hardening.unit.test.ts`).
+
+## Revision 4 (Host/Origin consistency and redirects)
+
+1. **Apps that require the Origin host to match Host now work without an override.** The gateway used to rewrite `Origin` to the LAN origin but leave `Host` as the remote host, so apps such as Murmur, whose CSRF check requires the `Origin` host to equal `Host` or `X-Forwarded-Host`, rejected every POST and WebSocket upgrade. `Host` is now rewritten to the LAN host together with `Origin`, the way a reverse proxy's `ProxyPass`/`ProxyPassReverse` pair presents a backend. LAN-allowlist apps such as Agent Zero keep working. See "Origin and Referer rewrite".
+2. **LAN redirects are rewritten.** A `Location` or `Refresh` URL pointing at the app's local address (for example lobe-chat's `http://umbrel.local:7455/signin`) becomes the same path on the app's remote host, and local `Set-Cookie` domains are dropped. See "Redirects".
+
+Tests added: gateway tests against an upstream that enforces the Murmur check (POST and WebSocket upgrade), one that enforces a LAN-origin allowlist, and redirect, `Refresh` and `Set-Cookie` rewriting (`app-gateway-remote.unit.test.ts`); URL matching helpers (`remote-domain.unit.test.ts`).

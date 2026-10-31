@@ -94,6 +94,10 @@ docker run -it --rm --name umbrel --pid=host --privileged -p 80:80 -p 443:443 -p
 
   The container has to be recreated rather than just restarted with the new image: umbrelOS 2.0 requires host PID mode and exits with `Host PID mode is required` when it is missing, so add `pid: host` (and `privileged: true`, see above) to your existing command or compose file. A 1.x container that ran without them will not start on 2.0.
 
+### How do I reach umbrelOS on a public domain (VPS)?
+
+  This fork adds an opt-in remote domain mode (`patches/0004-remote-domain.patch`). Put a TLS-terminating reverse proxy such as Traefik or Cloudflare in front of port 443. Then turn the mode on in **Settings → Advanced → Remote domain**. The dashboard is then served at `https://umbrel.<domain>`, app login at `https://umbrel-auth.<domain>` and each app at `https://<appId>-umbrel.<domain>`. LAN, IP and Tailscale access keep working as before. See [docs/remote-domain.md](docs/remote-domain.md) for the proxy, DNS and firewall requirements.
+
 ### How do I run CasaOS in a container?
 
   See [dockur/casa](https://github.com/dockur/casa) for a CasaOS container.

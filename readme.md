@@ -96,7 +96,7 @@ docker run -it --rm --name umbrel --pid=host --privileged -p 80:80 -p 443:443 -p
 
 ### How do I reach umbrelOS on a public domain (VPS)?
 
-  This fork adds an opt-in remote domain mode (`patches/0004-remote-domain.patch`). Put a TLS-terminating reverse proxy such as Traefik or Cloudflare in front of port 443. Then turn the mode on in **Settings → Advanced → Remote domain**. The dashboard is then served at `https://umbrel.<domain>`, app login at `https://umbrel-auth.<domain>` and each app at `https://<appId>-umbrel.<domain>`. LAN, IP and Tailscale access keep working as before. See [docs/remote-domain.md](docs/remote-domain.md) for the proxy, DNS and firewall requirements.
+  This fork adds an opt-in remote domain mode (`patches/0004-remote-domain.patch`). Put a TLS-terminating reverse proxy (for example Caddy or Traefik with a wildcard certificate, or a tunnel) in front of port 443. Then turn the mode on in **Settings → Advanced → Remote domain**. The dashboard is then served at `https://umbrel.<domain>`, app login at `https://umbrel-auth.<domain>` and each app at `https://<appId>-umbrel.<domain>`. LAN, IP and Tailscale access keep working as before. See [docs/remote-domain.md](docs/remote-domain.md) for the proxy, DNS and firewall requirements and the built-in login protection.
 
 ### How do I run CasaOS in a container?
 

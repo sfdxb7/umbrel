@@ -1,8 +1,8 @@
 diff --git a/packages/ui/public/locales/en.json b/packages/ui/public/locales/en.json
-index 41c8713..0308004 100644
+index 41c8713..c91d150 100644
 --- a/packages/ui/public/locales/en.json
 +++ b/packages/ui/public/locales/en.json
-@@ -2796,5 +2796,29 @@
+@@ -2796,5 +2796,37 @@
    "onboarding.raid.return-to-start": "Return to start",
    "onboarding.raid.return-to-start-warning": "Your Umbrel may still be working. Returning will check its current status, but won’t cancel or repeat the operation. Keep it powered on and review its storage before starting setup or restore again.",
    "onboarding.raid.wait-warning": "Keep your Umbrel powered on while you check its status.",
@@ -31,7 +31,15 @@ index 41c8713..0308004 100644
 +  "remote-domain.apps-title": "Apps on the remote domain",
 +  "remote-domain.apps-description": "Apps with Umbrel's login turned off are blocked on the remote domain. Allow one only if the app has its own login.",
 +  "remote-domain.app-allowed": "Allowed without Umbrel login at {{origin}}",
-+  "remote-domain.app-blocked": "Blocked: Umbrel's login is off for this app"
++  "remote-domain.app-blocked": "Blocked: Umbrel's login is off for this app",
++  "login.username-label": "Account name (leave empty for the owner)",
++  "remote-domain.2fa-warning": "Two-factor authentication is off for your account. With a remote domain your login page is on the internet, so turn on 2FA in Settings.",
++  "remote-domain.trusted-proxies": "Trusted reverse proxies",
++  "remote-domain.trusted-proxies-help": "IP addresses or ranges (CIDR) of the reverse proxies in front of this device, separated by commas. Only these may tell umbrelOS a visitor's real IP, which login rate limiting uses. Leave empty for loopback and private networks.",
++  "remote-domain.client-ip-header": "Client IP header",
++  "remote-domain.client-ip-header-help": "Optional. A header your trusted proxy sets to the visitor's IP, such as X-Real-IP. Leave empty to use X-Forwarded-For.",
++  "remote-domain.public-paths": "Allow public paths on the remote domain",
++  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself."
  }
 diff --git a/packages/ui/src/hooks/use-launch-app.ts b/packages/ui/src/hooks/use-launch-app.ts
 index 592c2c2..160d79a 100644
@@ -71,6 +79,64 @@ index c1feecb..332a0f6 100644
  	},
  }))
  ;(globalThis as {IS_REACT_ACT_ENVIRONMENT?: boolean}).IS_REACT_ACT_ENVIRONMENT = true
+diff --git a/packages/ui/src/modules/auth/login-form.tsx b/packages/ui/src/modules/auth/login-form.tsx
+index c843327..7a44961 100644
+--- a/packages/ui/src/modules/auth/login-form.tsx
++++ b/packages/ui/src/modules/auth/login-form.tsx
+@@ -1,7 +1,7 @@
+ import {Loader2} from 'lucide-react'
+ import {useTranslation} from 'react-i18next'
+ 
+-import {PasswordInput} from '@/components/ui/input'
++import {Input, PasswordInput} from '@/components/ui/input'
+ import {formGroupClass, primaryButtonProps, SubTitle, Title} from '@/layouts/bare/shared'
+ import {cn} from '@/lib/utils'
+ import {type Account} from '@/modules/auth/use-account-picker'
+@@ -21,6 +21,8 @@ export function LoginForm({
+ 	onSubmit,
+ 	subtitle,
+ 	submitLabel,
++	username,
++	onUsernameChange,
+ }: {
+ 	account?: Account
+ 	password: string
+@@ -30,7 +32,12 @@ export function LoginForm({
+ 	onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
+ 	subtitle?: string
+ 	submitLabel?: string
++	// Shown when the server hides the account list (the remote domain). An
++	// empty username means the owner.
++	username?: string
++	onUsernameChange?: (username: string) => void
+ }) {
++	const askUsername = onUsernameChange !== undefined
+ 	const {t} = useTranslation()
+ 	return (
+ 		<>
+@@ -55,9 +62,21 @@ export function LoginForm({
+ 			</div>
+ 			<form className='flex w-full flex-col items-center gap-5 px-4 md:px-0' onSubmit={onSubmit}>
+ 				<div className={cn(formGroupClass, 'max-w-[320px] [&_input]:bg-slate-500/15 [&_input]:backdrop-blur-xl')}>
++					{askUsername && (
++						<Input
++							placeholder={t('login.username-label')}
++							aria-label={t('login.username-label')}
++							autoComplete='username'
++							autoCapitalize='none'
++							spellCheck={false}
++							autoFocus
++							value={username ?? ''}
++							onValueChange={onUsernameChange}
++						/>
++					)}
+ 					<PasswordInput
+ 						label={t('login.password-label')}
+-						autoFocus
++						autoFocus={!askUsername}
+ 						value={password}
+ 						onValueChange={onPasswordChange}
+ 						error={error}
 diff --git a/packages/ui/src/providers/apps.tsx b/packages/ui/src/providers/apps.tsx
 index 13b2ca7..8fe0ade 100644
 --- a/packages/ui/src/providers/apps.tsx
@@ -99,6 +165,134 @@ index 13b2ca7..8fe0ade 100644
  	// Remove apps that have an error
  	// TODO: consider passing these down in some places (like the desktop)
  	const userApps = filter(appsQ.data ?? [], (app): app is UserApp => !('error' in app))
+diff --git a/packages/ui/src/routes/app-auth/index.tsx b/packages/ui/src/routes/app-auth/index.tsx
+index 92e88f5..9d58202 100644
+--- a/packages/ui/src/routes/app-auth/index.tsx
++++ b/packages/ui/src/routes/app-auth/index.tsx
+@@ -32,15 +32,22 @@ function useAccounts() {
+ 	// isLoaded flips once the request settles (success or failure) — the page
+ 	// holds on the bare wallpaper until then so the single-account form never
+ 	// flashes before the dock
+-	const [state, setState] = useState<{accounts: Account[]; isLoaded: boolean}>({accounts: [], isLoaded: false})
++	// askUsername: the server answered with an empty list, as it does on the
++	// remote domain instead of naming its accounts
++	const [state, setState] = useState<{accounts: Account[]; isLoaded: boolean; askUsername: boolean}>({
++		accounts: [],
++		isLoaded: false,
++		askUsername: false,
++	})
+ 
+ 	useEffect(() => {
+ 		fetch('/v1/account/accounts')
+ 			.then(async (res) => {
+ 				const data = (await res.json()) as unknown
+-				setState({accounts: Array.isArray(data) ? (data as Account[]) : [], isLoaded: true})
++				const accounts = Array.isArray(data) ? (data as Account[]) : []
++				setState({accounts, isLoaded: true, askUsername: res.ok && Array.isArray(data) && accounts.length === 0})
+ 			})
+-			.catch(() => setState({accounts: [], isLoaded: true}))
++			.catch(() => setState({accounts: [], isLoaded: true, askUsername: false}))
+ 	}, [])
+ 
+ 	return state
+@@ -59,7 +66,8 @@ export default function LoginWithUmbrel() {
+ 	const [step, setStep] = useState<Step>('account')
+ 
+ 	// Owner centered, members alternating outwards — same dock as the lock screen
+-	const {accounts: rawAccounts, isLoaded: accountsLoaded} = useAccounts()
++	const {accounts: rawAccounts, isLoaded: accountsLoaded, askUsername} = useAccounts()
++	const [username, setUsername] = useState('')
+ 	const {
+ 		accounts,
+ 		hasMultipleAccounts,
+@@ -141,7 +149,10 @@ export default function LoginWithUmbrel() {
+ 		if (!attempt) return
+ 		setError(undefined)
+ 		try {
+-			const data = await login({userId: attempt.userId, password, totpToken: ''}, () => isCurrentLoginAttempt(attempt))
++			const data = await login(
++				{userId: attempt.userId, username: askUsername ? username : undefined, password, totpToken: ''},
++				() => isCurrentLoginAttempt(attempt),
++			)
+ 			if (!isCurrentLoginAttempt(attempt)) {
+ 				finishLoginAttempt(attempt)
+ 				return
+@@ -181,7 +192,10 @@ export default function LoginWithUmbrel() {
+ 		const attempt = beginLoginAttempt()
+ 		if (!attempt) return false
+ 		try {
+-			const data = await login({userId: attempt.userId, password, totpToken}, () => isCurrentLoginAttempt(attempt))
++			const data = await login(
++				{userId: attempt.userId, username: askUsername ? username : undefined, password, totpToken},
++				() => isCurrentLoginAttempt(attempt),
++			)
+ 			if (!isCurrentLoginAttempt(attempt)) {
+ 				finishLoginAttempt(attempt)
+ 				return false
+@@ -335,6 +349,7 @@ export default function LoginWithUmbrel() {
+ 												onSubmit={handleSubmitPassword}
+ 												subtitle={app.name ? t('login-with-umbrel.description', {app: app.name}) : undefined}
+ 												submitLabel={app.name ? t('login-with-umbrel.open-app', {app: app.name}) : undefined}
++												{...(askUsername ? {username, onUsernameChange: setUsername} : {})}
+ 											/>
+ 										</div>
+ 									</motion.div>
+@@ -352,14 +367,14 @@ function useLogin() {
+ 	// /v1/account/login
+ 
+ 	const login = (
+-		{userId, password, totpToken}: {userId: string; password: string; totpToken: string},
++		{userId, username, password, totpToken}: {userId: string; username?: string; password: string; totpToken: string},
+ 		shouldSubmit: () => boolean,
+ 	) => {
+ 		// Forward the query params to the login endpoint
+ 		return fetch('/v1/account/login' + document.location.search, {
+ 			method: 'POST',
+ 			headers: {'Content-Type': 'application/json'},
+-			body: JSON.stringify({userId, password, totpToken}),
++			body: JSON.stringify({userId, password, totpToken, ...(username === undefined ? {} : {username})}),
+ 		}).then(async (res) => {
+ 			const parsed = (await res.json()) as LoginResponse | string
+ 			// The server responds with a bare string for request validation
+diff --git a/packages/ui/src/routes/login.tsx b/packages/ui/src/routes/login.tsx
+index a806280..be922d4 100644
+--- a/packages/ui/src/routes/login.tsx
++++ b/packages/ui/src/routes/login.tsx
+@@ -37,6 +37,10 @@ export default function Login() {
+ 	// the picker is skipped on single-user devices (identical to the old flow).
+ 	const accountsQ = trpcReact.user.listAccounts.useQuery(undefined, {retry: false})
+ 	const rawAccounts: Account[] = useMemo(() => accountsQ.data ?? [], [accountsQ.data])
++	// On the remote domain the server answers with an empty list instead of
++	// naming its accounts, so ask for the account name instead
++	const askUsername = accountsQ.isSuccess && rawAccounts.length === 0
++	const [username, setUsername] = useState('')
+ 	const {
+ 		accounts,
+ 		hasMultipleAccounts,
+@@ -148,13 +152,13 @@ export default function Login() {
+ 		e.preventDefault()
+ 		if (activeLoginUserIdRef.current !== undefined || loginMut.isPending) return
+ 		activeLoginUserIdRef.current = userId
+-		loginMut.mutate({userId, password})
++		loginMut.mutate({userId, password, ...(askUsername ? {username} : {})})
+ 	}
+ 
+ 	const handleSubmit2fa = async (totpToken: string) => {
+ 		if (activeLoginUserIdRef.current !== undefined || loginMut.isPending) return false
+ 		activeLoginUserIdRef.current = userId
+-		const res = await loginMut.mutateAsync({userId, password, totpToken})
++		const res = await loginMut.mutateAsync({userId, password, totpToken, ...(askUsername ? {username} : {})})
+ 		return selectedUserIdRef.current === userId && !!res
+ 	}
+ 
+@@ -215,6 +219,7 @@ export default function Login() {
+ 						error={loginError}
+ 						isPending={loginIsPending}
+ 						onSubmit={handleSubmitPassword}
++						{...(askUsername ? {username, onUsernameChange: setUsername} : {})}
+ 					/>
+ 				</div>
+ 				{confirmDialog}
 diff --git a/packages/ui/src/routes/settings/advanced.tsx b/packages/ui/src/routes/settings/advanced.tsx
 index 210e73e..9ea1b0c 100644
 --- a/packages/ui/src/routes/settings/advanced.tsx
@@ -153,10 +347,10 @@ index 210e73e..9ea1b0c 100644
  		) : activePanel === 'network' ? (
 diff --git a/packages/ui/src/routes/settings/remote-domain.tsx b/packages/ui/src/routes/settings/remote-domain.tsx
 new file mode 100644
-index 0000000..6773558
+index 0000000..a246704
 --- /dev/null
 +++ b/packages/ui/src/routes/settings/remote-domain.tsx
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,279 @@
 +import React from 'react'
 +import {useTranslation} from 'react-i18next'
 +import {TbAlertTriangle} from 'react-icons/tb'
@@ -165,6 +359,7 @@ index 0000000..6773558
 +import {Input, Labeled} from '@/components/ui/input'
 +import {Switch} from '@/components/ui/switch'
 +import {toast} from '@/components/ui/toast'
++import {cn} from '@/lib/utils'
 +import {BackButton} from '@/routes/settings/_components/shared'
 +import {trpcReact} from '@/trpc/trpc'
 +import {suggestBaseDomain} from '@/utils/remote-domain-suggestion'
@@ -178,20 +373,25 @@ index 0000000..6773558
 +	appSubdomainTemplate: string
 +	allowUnauthenticatedApps: string[]
 +	originRewriteDisabledApps: string[]
++	allowPublicPathApps: string[]
++	trustedProxies: string[]
++	clientIpHeader: string
 +}
 +
-+// Comma or space separated app ids, as typed in the advanced section.
-+function parseAppIds(value: string) {
++// Comma or space separated values (app ids, proxy addresses), as typed in the
++// advanced section.
++function parseList(value: string) {
 +	return [...new Set(value.split(/[\s,]+/).filter(Boolean))]
 +}
 +
-+// Owner-only settings for remote domain / VPS mode. See docs/remote-domain.md
-+// in the dockur/umbrel fork that carries this patch.
++// Owner-only settings for serving umbrelOS on a remote domain behind a
++// reverse proxy. See docs/remote-domain.md.
 +export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 +	const {t} = useTranslation()
 +	const utils = trpcReact.useUtils()
 +	const remoteQ = trpcReact.lanIngress.getRemoteDomain.useQuery()
 +	const setMut = trpcReact.lanIngress.setRemoteDomain.useMutation()
++	const twoFactorQ = trpcReact.user.is2faEnabled.useQuery()
 +	const [draft, setDraft] = React.useState<Draft>()
 +
 +	const data = remoteQ.data
@@ -203,16 +403,22 @@ index 0000000..6773558
 +		appSubdomainTemplate: data.appSubdomainTemplate,
 +		allowUnauthenticatedApps: 'allowUnauthenticatedApps' in data ? data.allowUnauthenticatedApps : [],
 +		originRewriteDisabledApps: 'originRewriteDisabledApps' in data ? data.originRewriteDisabledApps : [],
++		allowPublicPathApps: 'allowPublicPathApps' in data ? data.allowPublicPathApps : [],
++		trustedProxies: 'trustedProxies' in data ? data.trustedProxies : [],
++		clientIpHeader: 'clientIpHeader' in data ? data.clientIpHeader : '',
 +	}
++	const defaultTrustedProxies = data && 'defaultTrustedProxies' in data ? data.defaultTrustedProxies : []
 +	// With no saved domain, prefill one derived from this page's address
 +	// (umbrel.example.com -> example.com). It is only a draft: the mode stays
 +	// off until the owner turns it on and saves.
 +	const suggestion = data && !data.baseDomain ? suggestBaseDomain(window.location.hostname) : undefined
 +	const [rewriteDisabledText, setRewriteDisabledText] = React.useState('')
++	const [trustedProxiesText, setTrustedProxiesText] = React.useState('')
 +	React.useEffect(() => {
 +		if (saved && !draft) {
 +			setDraft({...saved, baseDomain: saved.baseDomain || suggestion || ''})
 +			setRewriteDisabledText(saved.originRewriteDisabledApps.join(', '))
++			setTrustedProxiesText(saved.trustedProxies.join(', '))
 +		}
 +	}, [saved, draft, suggestion])
 +	const showSuggestion = !!suggestion && draft?.baseDomain === suggestion
@@ -245,6 +451,20 @@ index 0000000..6773558
 +		update({allowUnauthenticatedApps})
 +	}
 +
++	const togglePublicPaths = (appId: string, allowed: boolean) => {
++		if (!saved) return
++		const allow = new Set(saved.allowPublicPathApps)
++		if (allowed) allow.add(appId)
++		else allow.delete(appId)
++		const allowPublicPathApps = [...allow]
++		void save({...saved, allowPublicPathApps}, {keepDraft: true})
++		update({allowPublicPathApps})
++	}
++
++	// A remote domain puts the login page on the internet. Nudge the owner
++	// towards 2FA without blocking the setting.
++	const show2faWarning = !!draft?.enabled && twoFactorQ.data === false
++
 +	return (
 +		<div className='flex flex-col gap-y-5'>
 +			<BackButton onClick={onBack}>{t('advanced-settings')}</BackButton>
@@ -256,6 +476,12 @@ index 0000000..6773558
 +				<TbAlertTriangle className='mt-0.5 size-5 shrink-0 text-[#F5A623]' />
 +				<span className='text-12 leading-tight text-white/60'>{t('remote-domain.warning')}</span>
 +			</div>
++			{show2faWarning && (
++				<div className='flex items-start gap-3 rounded-12 bg-[#F5A623]/10 p-3'>
++					<TbAlertTriangle className='mt-0.5 size-5 shrink-0 text-[#F5A623]' />
++					<span className='text-12 leading-tight text-white/60'>{t('remote-domain.2fa-warning')}</span>
++				</div>
++			)}
 +			{draft && (
 +				<form
 +					className='flex flex-col gap-y-3'
@@ -320,13 +546,34 @@ index 0000000..6773558
 +									value={rewriteDisabledText}
 +									onValueChange={(value) => {
 +										setRewriteDisabledText(value)
-+										update({originRewriteDisabledApps: parseAppIds(value)})
++										update({originRewriteDisabledApps: parseList(value)})
 +									}}
 +								/>
 +							</Labeled>
 +							<p className='-mt-1 text-12 leading-tight text-white/45'>
 +								{t('remote-domain.origin-rewrite-disabled-help')}
 +							</p>
++							<Labeled label={t('remote-domain.trusted-proxies')}>
++								<Input
++									sizeVariant='short-square'
++									placeholder={defaultTrustedProxies.join(', ')}
++									value={trustedProxiesText}
++									onValueChange={(value) => {
++										setTrustedProxiesText(value)
++										update({trustedProxies: parseList(value)})
++									}}
++								/>
++							</Labeled>
++							<p className='-mt-1 text-12 leading-tight text-white/45'>{t('remote-domain.trusted-proxies-help')}</p>
++							<Labeled label={t('remote-domain.client-ip-header')}>
++								<Input
++									sizeVariant='short-square'
++									placeholder='X-Forwarded-For'
++									value={draft.clientIpHeader}
++									onValueChange={(clientIpHeader) => update({clientIpHeader: clientIpHeader.trim()})}
++								/>
++							</Labeled>
++							<p className='-mt-1 text-12 leading-tight text-white/45'>{t('remote-domain.client-ip-header-help')}</p>
 +						</div>
 +					</details>
 +					<Button type='submit' variant='primary' size='dialog' disabled={setMut.isPending}>
@@ -339,23 +586,40 @@ index 0000000..6773558
 +					<h4 className='px-1 text-14 font-medium'>{t('remote-domain.apps-title')}</h4>
 +					<p className='px-1 text-12 leading-tight text-white/45'>{t('remote-domain.apps-description')}</p>
 +					{apps.map((app) => (
-+						<div key={app.appId} className={cardClass}>
-+							<div className='min-w-0 flex-1 space-y-1'>
-+								<h3 className='truncate text-14 leading-tight font-medium'>{app.appId}</h3>
-+								<p className='truncate text-12 leading-tight opacity-45'>
-+									{app.authEnabled
-+										? app.origin
-+										: app.allowed
-+											? t('remote-domain.app-allowed', {origin: app.origin})
-+											: t('remote-domain.app-blocked')}
-+								</p>
++						<div key={app.appId} className={cn(cardClass, 'flex-col gap-y-3')}>
++							<div className='flex w-full items-start gap-x-2'>
++								<div className='min-w-0 flex-1 space-y-1'>
++									<h3 className='truncate text-14 leading-tight font-medium'>{app.appId}</h3>
++									<p className='truncate text-12 leading-tight opacity-45'>
++										{app.authEnabled
++											? app.origin
++											: app.allowed
++												? t('remote-domain.app-allowed', {origin: app.origin})
++												: t('remote-domain.app-blocked')}
++									</p>
++								</div>
++								{!app.authEnabled && (
++									<Switch
++										checked={app.allowed}
++										disabled={setMut.isPending}
++										onCheckedChange={(allowed) => toggleApp(app.appId, allowed)}
++									/>
++								)}
 +							</div>
-+							{!app.authEnabled && (
-+								<Switch
-+									checked={app.allowed}
-+									disabled={setMut.isPending}
-+									onCheckedChange={(allowed) => toggleApp(app.appId, allowed)}
-+								/>
++							{app.authEnabled && app.publicPaths.length > 0 && (
++								<div className='flex w-full items-start gap-x-2 border-t border-white/6 pt-3'>
++									<div className='min-w-0 flex-1 space-y-1'>
++										<h4 className='text-13 leading-tight font-medium'>{t('remote-domain.public-paths')}</h4>
++										<p className='text-12 leading-tight break-all opacity-45'>
++											{t('remote-domain.public-paths-help', {paths: app.publicPaths.join(', ')})}
++										</p>
++									</div>
++									<Switch
++										checked={app.publicPathsAllowed}
++										disabled={setMut.isPending}
++										onCheckedChange={(allowed) => togglePublicPaths(app.appId, allowed)}
++									/>
++								</div>
 +							)}
 +						</div>
 +					))}
@@ -570,10 +834,10 @@ index 89225ba..233359f 100644
  			{
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
 new file mode 100644
-index 0000000..38ef5c7
+index 0000000..24a27f2
 --- /dev/null
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,361 @@
 +import http from 'node:http'
 +import net from 'node:net'
 +import {once} from 'node:events'
@@ -848,19 +1112,108 @@ index 0000000..38ef5c7
 +		expect(upstream.seen[1]).toMatchObject({origin: `https://${remoteHost}`, 'x-forwarded-host': remoteHost})
 +	})
 +})
++
++describe('app gateway public paths on the remote domain', () => {
++	const closers: Array<() => Promise<void>> = []
++	afterEach(async () => {
++		await Promise.all(closers.splice(0).map((close) => close()))
++	})
++
++	async function listen(server: http.Server) {
++		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++		closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
++		return (server.address() as net.AddressInfo).port
++	}
++
++	async function startGateway(remoteDomain: RemoteDomain | undefined) {
++		const upstreamPort = await listen(http.createServer((_request, response) => response.end('upstream')))
++		const umbreld = {
++			logger: {error: vi.fn()},
++			dataDirectory: '/does-not-exist',
++			auth: {
++				appAccessRevision: 0,
++				authenticate: vi.fn(async () => {
++					throw new Error('unauthenticated')
++				}),
++				authorizeApp: vi.fn(),
++			},
++		}
++		const gateway = new AppGateway(
++			umbreld as never,
++			{
++				appId: 'vaultwarden',
++				appName: 'Vaultwarden',
++				appIcon: 'https://example.com/icon.svg',
++				targetProtocol: 'http',
++				targetHost: 'vaultwarden_server_1',
++				targetAddress: '127.0.0.1',
++				targetPort: upstreamPort,
++				auth: true,
++				authWhitelist: ['/api/*', '/identity/*'],
++				authBlacklist: ['/api/admin'],
++				trustUpstream: false,
++				timeout: 1_000,
++			},
++			{getRemoteDomain: () => remoteDomain},
++		)
++		const port = await listen(gateway.server)
++		return `http://127.0.0.1:${port}`
++	}
++
++	const get = (origin: string, path: string, host: string) =>
++		fetch(`${origin}${path}`, {
++			redirect: 'manual',
++			headers: {'x-forwarded-host': host, 'x-forwarded-proto': 'https'},
++		})
++
++	test('ignores PROXY_AUTH_WHITELIST on the remote host by default', async () => {
++		const origin = await startGateway(remote)
++		const response = await get(origin, '/api/sync', 'vaultwarden-umbrel.example.com')
++		expect(response.status).toBe(302)
++		expect(new URL(response.headers.get('location')!).origin).toBe('https://umbrel-auth.example.com')
++	})
++
++	test('honours it remotely once the owner allows the app', async () => {
++		const allowed = resolveRemoteDomain({
++			enabled: true,
++			baseDomain: 'example.com',
++			allowPublicPathApps: ['vaultwarden'],
++		})!
++		const origin = await startGateway(allowed)
++		const response = await get(origin, '/identity/connect/token', 'vaultwarden-umbrel.example.com')
++		expect(response.status).toBe(200)
++		expect(await response.text()).toBe('upstream')
++		// The blacklist and non-public paths still need Umbrel login
++		expect((await get(origin, '/api/admin', 'vaultwarden-umbrel.example.com')).status).toBe(302)
++		expect((await get(origin, '/vault', 'vaultwarden-umbrel.example.com')).status).toBe(302)
++	})
++
++	test('keeps upstream behaviour on the LAN and when the mode is off', async () => {
++		for (const remoteDomain of [remote, undefined]) {
++			const origin = await startGateway(remoteDomain)
++			const lan = await get(origin, '/api/sync', '192.168.1.10:8080')
++			expect(lan.status).toBe(200)
++			expect(await lan.text()).toBe('upstream')
++		}
++		const off = await startGateway(undefined)
++		expect((await get(off, '/api/sync', 'vaultwarden-umbrel.example.com')).status).toBe(200)
++	})
++})
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway.ts b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-index b799fd2..9e34083 100644
+index b799fd2..590ba34 100644
 --- a/packages/umbreld/source/modules/app-gateway/app-gateway.ts
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-@@ -18,6 +18,15 @@ import {
+@@ -18,6 +18,17 @@ import {
  } from '../auth/app-gateway-cookie.js'
  import {SESSION_DURATION} from '../auth/auth.js'
  import {appGatewayErrorPage} from './error-page.js'
 +import safeRedirectPath from '../utilities/safe-redirect-path.js'
 +import {
 +	appRemoteHost,
++	isRemoteDomainRequest,
 +	normaliseHostHeader,
 +	remoteAppAuthUrl,
++	remotePublicPathsAllowed,
 +	remoteOriginRewrite,
 +	rewriteRemoteOriginHeaders,
 +	type RemoteDomain,
@@ -868,7 +1221,7 @@ index b799fd2..9e34083 100644
  
  export type AppGatewayConfig = {
  	appId: string
-@@ -36,6 +45,11 @@ export type AppGatewayConfig = {
+@@ -36,6 +47,11 @@ export type AppGatewayConfig = {
  
  type AppGatewayOptions = {
  	onUpstreamUnavailable?: () => void
@@ -880,7 +1233,7 @@ index b799fd2..9e34083 100644
  }
  
  function environmentRecord(environment: unknown) {
-@@ -127,14 +141,30 @@ export function pathMatches(pathname: string, rules: string[]) {
+@@ -127,14 +143,30 @@ export function pathMatches(pathname: string, rules: string[]) {
  	})
  }
  
@@ -919,7 +1272,7 @@ index b799fd2..9e34083 100644
  }
  
  function hostWithPort(hostname: string, port: number) {
-@@ -146,6 +176,8 @@ export default class AppGateway {
+@@ -146,6 +178,8 @@ export default class AppGateway {
  	#umbreld: Umbreld
  	#config: AppGatewayConfig
  	#onUpstreamUnavailable?: () => void
@@ -928,7 +1281,7 @@ index b799fd2..9e34083 100644
  	#proxy: ReturnType<typeof createProxyMiddleware>
  	server: http.Server
  
-@@ -153,6 +185,8 @@ export default class AppGateway {
+@@ -153,6 +187,8 @@ export default class AppGateway {
  		this.#umbreld = umbreld
  		this.#config = config
  		this.#onUpstreamUnavailable = options.onUpstreamUnavailable
@@ -937,7 +1290,7 @@ index b799fd2..9e34083 100644
  		this.#proxy = this.createProxy()
  
  		const app = express()
-@@ -205,8 +239,12 @@ export default class AppGateway {
+@@ -205,8 +241,12 @@ export default class AppGateway {
  					proxyRequest.setHeader('x-forwarded-for', request.socket.remoteAddress)
  				}
  				this.stripCookies(proxyRequest, request)
@@ -951,7 +1304,7 @@ index b799fd2..9e34083 100644
  			onError: (error, _request, response) => this.handleUpstreamError(response, error),
  		})
  	}
-@@ -265,6 +303,27 @@ export default class AppGateway {
+@@ -265,10 +305,40 @@ export default class AppGateway {
  		else proxyRequest.removeHeader('cookie')
  	}
  
@@ -976,10 +1329,24 @@ index b799fd2..9e34083 100644
 +		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
 +	}
 +
++	// Manifest-declared public paths (PROXY_AUTH_WHITELIST) were designed for the
++	// LAN. On the remote domain they would be public on the internet, so they
++	// only apply there when the owner allowed it for this app.
++	private publicPathsApply(request: express.Request | http.IncomingMessage) {
++		const remote = this.#getRemoteDomain?.()
++		if (!isRemoteDomainRequest(remote, browserHost(request))) return true
++		return remotePublicPathsAllowed(remote!, this.#config.appId)
++	}
++
  	private async isAuthorized(request: express.Request | http.IncomingMessage) {
  		if (!this.#config.auth) return
  		const pathname = new URL(request.url ?? '/', 'http://umbrel.local').pathname
-@@ -295,6 +354,16 @@ export default class AppGateway {
+-		const whitelisted = pathMatches(pathname, this.#config.authWhitelist)
++		const whitelisted = this.publicPathsApply(request) && pathMatches(pathname, this.#config.authWhitelist)
+ 		const blacklisted = pathMatches(pathname, this.#config.authBlacklist)
+ 		if (whitelisted && !blacklisted) return
+ 
+@@ -295,6 +365,16 @@ export default class AppGateway {
  		try {
  			await this.isAuthorized(request)
  		} catch {
@@ -1179,10 +1546,10 @@ index 0000000..3d08a1d
 +	})
 +})
 diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
-index 65ebec6..b93ea0e 100644
+index 65ebec6..38fd88e 100644
 --- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
 +++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
-@@ -19,6 +19,15 @@ import {forwardTcp} from './forward-tcp.js'
+@@ -19,6 +19,16 @@ import {forwardTcp} from './forward-tcp.js'
  import {readNativeTlsPrelude} from './native-tls-preread.js'
  import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
  import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
@@ -1192,13 +1559,14 @@ index 65ebec6..b93ea0e 100644
 +	lanAppOrigin,
 +	matchRemoteHost,
 +	normaliseHostHeader,
++	remotePublicPathsAllowed,
 +	resolveRemoteDomain,
 +	type RemoteDomain,
 +} from './remote-domain.js'
  
  const NFT_BIN = '/usr/sbin/nft'
  
-@@ -59,6 +68,80 @@ type UmbrelProxyOptions = {
+@@ -59,6 +69,84 @@ type UmbrelProxyOptions = {
  	includeForwardedFor?: boolean
  	pathPrefix?: string
  	redirectUnexpectedAppAuthNavigation?: boolean
@@ -1223,6 +1591,10 @@ index 65ebec6..b93ea0e 100644
 +	authEnabled: boolean
 +	allowed: boolean
 +	reachable: boolean
++	// Paths the app's manifest makes public (PROXY_AUTH_WHITELIST). On the
++	// remote domain they need the owner's per-app opt-in.
++	publicPaths: string[]
++	publicPathsAllowed: boolean
 +}
 +
 +// Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
@@ -1279,7 +1651,7 @@ index 65ebec6..b93ea0e 100644
  }
  
  type AppMuxServer = {
-@@ -67,6 +150,7 @@ type AppMuxServer = {
+@@ -67,6 +155,7 @@ type AppMuxServer = {
  	httpsProxyServer?: https.Server
  	gatewayServer?: http.Server
  	loopbackServer?: net.Server
@@ -1287,7 +1659,7 @@ index 65ebec6..b93ea0e 100644
  }
  
  type ComposeFile = {
-@@ -133,6 +217,17 @@ export default class LanIngress {
+@@ -133,6 +222,17 @@ export default class LanIngress {
  	#appAuthHttpsProxyServer?: https.Server
  	#appMuxServers = new Map<string, AppMuxServer>()
  	#appGatewayWaits = new Map<string, {target: string; controller: AbortController; ready: boolean}>()
@@ -1305,7 +1677,7 @@ index 65ebec6..b93ea0e 100644
  	// Track sockets at the TCP layer because Node's HTTP force-close helper does not cover
  	// upgraded/raw sockets, and the mux servers are plain net.Server instances.
  	#activeSocketsByServer = new WeakMap<net.Server | http.Server, Set<net.Socket>>()
-@@ -174,6 +269,7 @@ export default class LanIngress {
+@@ -174,6 +274,7 @@ export default class LanIngress {
  			// nftables rules exist before browser/app traffic starts flowing.
  			await this.refresh()
  			if (this.#isStopped) return
@@ -1313,7 +1685,7 @@ index 65ebec6..b93ea0e 100644
  
  			// Keep cert SANs and app-port routes converged even when IPs, Avahi names,
  			// or app state change outside the normal app lifecycle hooks.
-@@ -203,6 +299,10 @@ export default class LanIngress {
+@@ -203,6 +304,10 @@ export default class LanIngress {
  		this.#isStopped = true
  		this.#stopPeriodicRefresh?.()
  		this.#stopPeriodicRefresh = undefined
@@ -1324,7 +1696,7 @@ index 65ebec6..b93ea0e 100644
  		this.#nextAppTargetRecoveryAt.clear()
  		// Let any in-flight refresh finish before cleanup. Otherwise a refresh could
  		// re-create listeners or re-apply nftables after stop() has cleared them.
-@@ -314,6 +414,27 @@ export default class LanIngress {
+@@ -314,6 +419,27 @@ export default class LanIngress {
  		return false
  	}
  
@@ -1352,7 +1724,7 @@ index 65ebec6..b93ea0e 100644
  	// Queue a refresh of LAN ingress state; callers share the running refresh promise.
  	async refresh() {
  		if (this.#isStopped) return
-@@ -346,6 +467,18 @@ export default class LanIngress {
+@@ -346,6 +472,18 @@ export default class LanIngress {
  
  	// Rebuild certs, routes, nftables rules, and listeners from current state.
  	private async applyCurrentState() {
@@ -1371,7 +1743,7 @@ index 65ebec6..b93ea0e 100644
  		await fse.ensureDir(this.directory)
  		const sans = await this.getServerSans()
  		await this.ensureServerCertificate(sans)
-@@ -365,6 +498,13 @@ export default class LanIngress {
+@@ -365,6 +503,13 @@ export default class LanIngress {
  		await this.applyNftRuleset(nextAppRoutes)
  	}
  
@@ -1385,7 +1757,7 @@ index 65ebec6..b93ea0e 100644
  	private async getServerSans() {
  		const names = new Set(['umbrel.local', 'localhost'])
  		const hostname = await getHostname().catch(() => 'umbrel')
-@@ -810,6 +950,183 @@ export default class LanIngress {
+@@ -810,6 +955,192 @@ export default class LanIngress {
  		await this.ensureDashboardHttpsServer()
  		await this.ensureAppAuthMuxServer()
  		await this.updateAppMuxServers(appRoutes)
@@ -1462,7 +1834,16 @@ index 65ebec6..b93ea0e 100644
 +			.map(([host, appId]) => {
 +				const authEnabled = this.remoteAppAuth(appId) !== false
 +				const allowed = remote.allowUnauthenticatedApps.includes(appId)
-+				return {appId, origin: `https://${host}`, authEnabled, allowed, reachable: authEnabled || allowed}
++				const publicPaths = authEnabled ? (this.#appMuxServers.get(appId)?.route.gateway?.authWhitelist ?? []) : []
++				return {
++					appId,
++					origin: `https://${host}`,
++					authEnabled,
++					allowed,
++					reachable: authEnabled || allowed,
++					publicPaths,
++					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
++				}
 +			})
 +			.sort((a, b) => a.appId.localeCompare(b.appId))
 +	}
@@ -1569,7 +1950,7 @@ index 65ebec6..b93ea0e 100644
  	}
  
  	private async loadSecureContext() {
-@@ -824,13 +1141,13 @@ export default class LanIngress {
+@@ -824,13 +1155,13 @@ export default class LanIngress {
  
  	private async ensureDashboardHttpServer() {
  		if (this.#dashboardHttpServer) return
@@ -1585,7 +1966,7 @@ index 65ebec6..b93ea0e 100644
  		await this.listen(this.#dashboardHttpsServer, 443)
  	}
  
-@@ -894,6 +1211,8 @@ export default class LanIngress {
+@@ -894,6 +1225,8 @@ export default class LanIngress {
  			if (route.gateway) {
  				gatewayServer = new AppGateway(this.#umbreld, route.gateway, {
  					onUpstreamUnavailable: () => void this.requestAppTargetRecovery(route.gateway!),
@@ -1594,7 +1975,7 @@ index 65ebec6..b93ea0e 100644
  				}).server
  				await this.listen(gatewayServer, 0, '127.0.0.1')
  				upstreamPort = this.serverPort(gatewayServer)
-@@ -1005,8 +1324,14 @@ export default class LanIngress {
+@@ -1005,8 +1338,14 @@ export default class LanIngress {
  		originalProtocol: 'http' | 'https',
  		options: UmbrelProxyOptions = {},
  	) {
@@ -1610,7 +1991,7 @@ index 65ebec6..b93ea0e 100644
  			if (options.redirectUnexpectedAppAuthNavigation) {
  				const redirect = appAuthDashboardRedirect({
  					protocol: originalProtocol,
-@@ -1030,19 +1355,26 @@ export default class LanIngress {
+@@ -1030,19 +1369,26 @@ export default class LanIngress {
  		// Let umbreld and upstream apps enforce their own upload deadlines.
  		// Keep the separate timeout for receiving request headers.
  		server.requestTimeout = 0
@@ -1639,7 +2020,7 @@ index 65ebec6..b93ea0e 100644
  				if (options.redirectUnexpectedAppAuthNavigation) {
  					const redirect = appAuthDashboardRedirect({
  						protocol: 'https',
-@@ -1067,14 +1399,14 @@ export default class LanIngress {
+@@ -1067,14 +1413,14 @@ export default class LanIngress {
  		// Let umbreld and upstream apps enforce their own upload deadlines.
  		// Keep the separate timeout for receiving request headers.
  		server.requestTimeout = 0
@@ -1656,7 +2037,7 @@ index 65ebec6..b93ea0e 100644
  	): RequestHandler {
  		const rewritePath = pathPrefix
  			? (path: string) =>
-@@ -1085,7 +1417,9 @@ export default class LanIngress {
+@@ -1085,7 +1431,9 @@ export default class LanIngress {
  		return createProxyMiddleware({
  			target: `http://127.0.0.1:${upstreamPort}`,
  			changeOrigin: false,
@@ -1667,7 +2048,7 @@ index 65ebec6..b93ea0e 100644
  			pathRewrite: rewritePath,
  			// Umbrel-owned upstreams (dashboard, app-auth) get X-Forwarded-For since they
  			// only trust it from loopback. App upstreams must not: some apps reject any
-@@ -1131,8 +1465,17 @@ export default class LanIngress {
+@@ -1131,8 +1479,17 @@ export default class LanIngress {
  		})
  	}
  
@@ -1689,10 +2070,10 @@ index 65ebec6..b93ea0e 100644
  	private serverPort(server: net.Server | http.Server) {
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
 new file mode 100644
-index 0000000..13a382e
+index 0000000..df31bbb
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,327 @@
 +import net from 'node:net'
 +
 +// Opt-in "remote domain" mode: umbrelOS sits behind a TLS-terminating reverse
@@ -1713,6 +2094,16 @@ index 0000000..13a382e
 +	// App ids that should receive the browser's original Origin and Referer
 +	// headers instead of the LAN-equivalent ones (see rewriteRemoteOriginHeaders).
 +	originRewriteDisabledApps?: string[]
++	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
++	// public on the remote domain. Off for every app by default.
++	allowPublicPathApps?: string[]
++	// Reverse proxies whose X-Forwarded-For (or clientIpHeader) umbreld trusts
++	// for remote-domain requests, as IPs or CIDRs. Unset means loopback and
++	// private networks, where a proxy on the same machine or network sits.
++	trustedProxies?: string[]
++	// Optional header a trusted proxy sets to the client IP, for example
++	// X-Real-IP. Unset means the X-Forwarded-For chain is used.
++	clientIpHeader?: string
 +}
 +
 +export type RemoteDomain = {
@@ -1723,12 +2114,23 @@ index 0000000..13a382e
 +	appSubdomainTemplate: string
 +	allowUnauthenticatedApps: string[]
 +	originRewriteDisabledApps: string[]
++	allowPublicPathApps: string[]
++	trustedProxies: string[]
++	clientIpHeader?: string
 +}
 +
 +export const DEFAULT_DASHBOARD_SUBDOMAIN = 'umbrel'
 +export const DEFAULT_AUTH_SUBDOMAIN = 'umbrel-auth'
 +export const DEFAULT_APP_SUBDOMAIN_TEMPLATE = '{app}-umbrel'
 +export const APP_PLACEHOLDER = '{app}'
++export const DEFAULT_TRUSTED_PROXIES = [
++	'127.0.0.0/8',
++	'::1/128',
++	'10.0.0.0/8',
++	'172.16.0.0/12',
++	'192.168.0.0/16',
++	'fc00::/7',
++]
 +
 +const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 +const MAX_DOMAIN_LENGTH = 253
@@ -1767,12 +2169,33 @@ index 0000000..13a382e
 +		return 'Enter a valid app subdomain pattern such as {app}-umbrel'
 +}
 +
++// An IP address or CIDR range such as 172.18.0.0/16.
++export function validateTrustedProxy(value: string) {
++	const [address, prefix, ...rest] = value.split('/')
++	const family = net.isIP(address ?? '')
++	if (!family || rest.length) return `Invalid trusted proxy ${value}`
++	if (prefix === undefined) return
++	const bits = Number(prefix)
++	if (!/^\d+$/.test(prefix) || bits > (family === 4 ? 32 : 128)) return `Invalid trusted proxy ${value}`
++}
++
++export function validateClientIpHeader(value: string) {
++	if (!/^[a-zA-Z0-9-]{1,64}$/.test(value)) return 'Enter a header name such as X-Real-IP'
++	const name = value.toLowerCase()
++	// Headers umbreld or the browser control; using them would be meaningless or spoofable.
++	if (['host', 'cookie', 'authorization', 'x-forwarded-host', 'x-forwarded-proto'].includes(name)) {
++		return `${value} cannot carry the client IP`
++	}
++}
++
 +export function validateRemoteDomainSettings(settings: RemoteDomainSettings) {
 +	const errors = [
 +		validateBaseDomain(settings.baseDomain),
 +		validateSubdomain(settings.dashboardSubdomain ?? DEFAULT_DASHBOARD_SUBDOMAIN),
 +		validateSubdomain(settings.authSubdomain ?? DEFAULT_AUTH_SUBDOMAIN),
 +		validateAppSubdomainTemplate(settings.appSubdomainTemplate ?? DEFAULT_APP_SUBDOMAIN_TEMPLATE),
++		...(settings.trustedProxies ?? []).map(validateTrustedProxy),
++		settings.clientIpHeader ? validateClientIpHeader(settings.clientIpHeader) : undefined,
 +	].filter(Boolean)
 +	if (errors.length) return errors[0]
 +	const dashboardHost = `${settings.dashboardSubdomain ?? DEFAULT_DASHBOARD_SUBDOMAIN}.${settings.baseDomain}`
@@ -1810,6 +2233,13 @@ index 0000000..13a382e
 +		appSubdomainTemplate,
 +		allowUnauthenticatedApps: [...new Set(settings.allowUnauthenticatedApps ?? [])],
 +		originRewriteDisabledApps: [...new Set(settings.originRewriteDisabledApps ?? [])],
++		allowPublicPathApps: [...new Set(settings.allowPublicPathApps ?? [])],
++		trustedProxies: settings.trustedProxies?.length
++			? settings.trustedProxies.filter((entry) => !validateTrustedProxy(entry))
++			: DEFAULT_TRUSTED_PROXIES,
++		...(settings.clientIpHeader && !validateClientIpHeader(settings.clientIpHeader)
++			? {clientIpHeader: settings.clientIpHeader.toLowerCase()}
++			: {}),
 +	}
 +}
 +
@@ -1957,27 +2387,46 @@ index 0000000..13a382e
 +	}
 +	return result
 +}
++
++// True for any request whose Host is the base domain or below it. Such
++// requests came through the public reverse proxy (or look like they did), so
++// they get the stricter remote behaviour. LAN, IP, mDNS, Tor and Tailscale
++// hosts never match.
++export function isRemoteDomainRequest(remote: RemoteDomain | undefined, hostname: string | undefined) {
++	return !!remote && !!hostname && isUnderBaseDomain(remote, hostname)
++}
++
++// Whether an app's manifest-declared public paths stay public on its remote
++// host. Off unless the owner allowed it for this app.
++export function remotePublicPathsAllowed(remote: RemoteDomain, appId: string) {
++	return remote.allowPublicPathApps.includes(appId)
++}
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
 new file mode 100644
-index 0000000..d55cdaf
+index 0000000..c417544
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,343 @@
 +import {describe, expect, test} from 'vitest'
 +
 +import {
++	DEFAULT_TRUSTED_PROXIES,
 +	appRemoteHost,
 +	buildAppHostMap,
 +	isRemoteAuthRequest,
++	isRemoteDomainRequest,
 +	lanAppOrigin,
 +	matchRemoteHost,
 +	normaliseHostHeader,
++	remotePublicPathsAllowed,
 +	remoteAppAuthUrl,
 +	remoteOriginRewrite,
 +	resolveRemoteDomain,
 +	rewriteRemoteOriginHeaders,
 +	validateBaseDomain,
++	validateClientIpHeader,
 +	validateRemoteDomainSettings,
++	validateTrustedProxy,
 +} from './remote-domain.js'
 +import {remoteDispatch} from './lan-ingress.js'
 +
@@ -1998,6 +2447,9 @@ index 0000000..d55cdaf
 +			appSubdomainTemplate: '{app}-umbrel',
 +			allowUnauthenticatedApps: [],
 +			originRewriteDisabledApps: [],
++			allowPublicPathApps: [],
++			trustedProxies: DEFAULT_TRUSTED_PROXIES,
++			clientIpHeader: undefined,
 +		})
 +		expect(appRemoteHost(remote, 'nextcloud')).toBe('nextcloud-umbrel.example.com')
 +	})
@@ -2228,11 +2680,81 @@ index 0000000..d55cdaf
 +		expect(remoteOriginRewrite(optedOut, 'agent-zero', 'agent-zero-umbrel.example.com', lan)?.lanOrigin).toBeUndefined()
 +	})
 +})
++
++describe('remote hardening settings', () => {
++	test('validates trusted proxies', () => {
++		for (const ok of ['172.18.0.2', '172.16.0.0/12', '::1', 'fc00::/7', '2001:db8::/128', '0.0.0.0/0']) {
++			expect(validateTrustedProxy(ok)).toBeUndefined()
++		}
++		for (const bad of ['', 'proxy', '172.18.0.0/33', '::/129', '10.0.0.0/8/1', '10.0.0.0/x', '10.0.0.0/']) {
++			expect(validateTrustedProxy(bad)).toBeTruthy()
++		}
++	})
++
++	test('validates the client IP header', () => {
++		expect(validateClientIpHeader('X-Real-IP')).toBeUndefined()
++		expect(validateClientIpHeader('CF-Connecting-IP')).toBeUndefined()
++		for (const bad of [
++			'',
++			'X Real',
++			'a:b',
++			'Host',
++			'cookie',
++			'Authorization',
++			'X-Forwarded-Host',
++			'x-forwarded-proto',
++		]) {
++			expect(validateClientIpHeader(bad)).toBeTruthy()
++		}
++		expect(validateClientIpHeader('x'.repeat(65))).toBeTruthy()
++	})
++
++	test('rejects invalid hardening settings and resolves valid ones', () => {
++		const base = {enabled: true, baseDomain: 'example.com'}
++		expect(validateRemoteDomainSettings({...base, trustedProxies: ['10.0.0.0/8', 'nope']})).toBe(
++			'Invalid trusted proxy nope',
++		)
++		expect(validateRemoteDomainSettings({...base, clientIpHeader: 'Host'})).toBe('Host cannot carry the client IP')
++		const resolved = resolveRemoteDomain({
++			...base,
++			trustedProxies: ['198.51.100.7'],
++			clientIpHeader: 'X-Real-IP',
++			allowPublicPathApps: ['vaultwarden', 'vaultwarden'],
++		})!
++		expect(resolved.trustedProxies).toEqual(['198.51.100.7'])
++		expect(resolved.clientIpHeader).toBe('x-real-ip')
++		expect(resolved.allowPublicPathApps).toEqual(['vaultwarden'])
++		expect(resolveRemoteDomain({...base, trustedProxies: []})!.trustedProxies).toEqual(DEFAULT_TRUSTED_PROXIES)
++		expect(resolveRemoteDomain({...base, clientIpHeader: 'Host'})!.clientIpHeader).toBeUndefined()
++	})
++
++	test('public paths stay off remotely unless allowed per app', () => {
++		expect(remotePublicPathsAllowed(remote, 'vaultwarden')).toBe(false)
++		const allowed = resolveRemoteDomain({
++			enabled: true,
++			baseDomain: 'example.com',
++			allowPublicPathApps: ['vaultwarden'],
++		})!
++		expect(remotePublicPathsAllowed(allowed, 'vaultwarden')).toBe(true)
++		expect(remotePublicPathsAllowed(allowed, 'nextcloud')).toBe(false)
++	})
++
++	test('isRemoteDomainRequest() matches only the base domain and below', () => {
++		expect(isRemoteDomainRequest(remote, 'umbrel.example.com')).toBe(true)
++		expect(isRemoteDomainRequest(remote, 'anything.example.com')).toBe(true)
++		expect(isRemoteDomainRequest(remote, 'example.com')).toBe(true)
++		for (const host of ['192.168.1.10', 'umbrel.local', 'abc.onion', 'example.com.evil.com', 'notexample.com']) {
++			expect(isRemoteDomainRequest(remote, host)).toBe(false)
++		}
++		expect(isRemoteDomainRequest(undefined, 'umbrel.example.com')).toBe(false)
++		expect(isRemoteDomainRequest(remote, undefined)).toBe(false)
++	})
++})
 diff --git a/packages/umbreld/source/modules/lan-ingress/routes.ts b/packages/umbreld/source/modules/lan-ingress/routes.ts
-index 8b3c217..7aa5f2a 100644
+index 8b3c217..22dd95c 100644
 --- a/packages/umbreld/source/modules/lan-ingress/routes.ts
 +++ b/packages/umbreld/source/modules/lan-ingress/routes.ts
-@@ -1,6 +1,87 @@
+@@ -1,6 +1,101 @@
 -import {privateProcedure, router} from '../server/trpc/trpc.js'
 +import z from 'zod'
 +import {TRPCError} from '@trpc/server'
@@ -2243,6 +2765,7 @@ index 8b3c217..7aa5f2a 100644
 +	DEFAULT_APP_SUBDOMAIN_TEMPLATE,
 +	DEFAULT_AUTH_SUBDOMAIN,
 +	DEFAULT_DASHBOARD_SUBDOMAIN,
++	DEFAULT_TRUSTED_PROXIES,
 +	validateRemoteDomainSettings,
 +	type RemoteDomainSettings,
 +} from './remote-domain.js'
@@ -2261,6 +2784,12 @@ index 8b3c217..7aa5f2a 100644
 +		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
 +		.max(500)
 +		.optional(),
++	allowPublicPathApps: z
++		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
++		.max(500)
++		.optional(),
++	trustedProxies: z.array(z.string().trim().max(64)).max(100).optional(),
++	clientIpHeader: z.string().trim().max(64).optional(),
 +})
  
  export default router({
@@ -2293,6 +2822,10 @@ index 8b3c217..7aa5f2a 100644
 +			...result,
 +			allowUnauthenticatedApps: stored?.allowUnauthenticatedApps ?? [],
 +			originRewriteDisabledApps: stored?.originRewriteDisabledApps ?? [],
++			allowPublicPathApps: stored?.allowPublicPathApps ?? [],
++			trustedProxies: stored?.trustedProxies ?? [],
++			defaultTrustedProxies: DEFAULT_TRUSTED_PROXIES,
++			clientIpHeader: stored?.clientIpHeader ?? '',
 +			apps: lanIngress.remoteAppStatus(),
 +		}
 +	}),
@@ -2303,6 +2836,9 @@ index 8b3c217..7aa5f2a 100644
 +			...input,
 +			allowUnauthenticatedApps: [...new Set(input.allowUnauthenticatedApps ?? [])],
 +			originRewriteDisabledApps: [...new Set(input.originRewriteDisabledApps ?? [])],
++			allowPublicPathApps: [...new Set(input.allowPublicPathApps ?? [])],
++			trustedProxies: [...new Set((input.trustedProxies ?? []).filter(Boolean))],
++			clientIpHeader: input.clientIpHeader || undefined,
 +		}
 +		if (next.enabled || next.baseDomain) {
 +			const error = validateRemoteDomainSettings(next)
@@ -2442,15 +2978,17 @@ index 0000000..8e888c9
 +	})
 +})
 diff --git a/packages/umbreld/source/modules/server/app-auth.ts b/packages/umbreld/source/modules/server/app-auth.ts
-index 5a704cb..59139c1 100644
+index 5a704cb..dec69be 100644
 --- a/packages/umbreld/source/modules/server/app-auth.ts
 +++ b/packages/umbreld/source/modules/server/app-auth.ts
-@@ -11,10 +11,12 @@ import {SessionIssuanceInvalidatedError} from '../auth/auth.js'
+@@ -11,10 +11,14 @@ import {SessionIssuanceInvalidatedError} from '../auth/auth.js'
  import {serializeAccountAvatar, serveAccountAvatar} from '../user/avatar-api.js'
  import {OWNER_USER_ID} from '../user/constants.js'
  import {resolveWallpaperAppearance} from '../user/wallpapers.js'
 +import safeRedirectPath from '../utilities/safe-redirect-path.js'
-+import {isRemoteAuthRequest} from '../lan-ingress/remote-domain.js'
++import {isRemoteAuthRequest, isRemoteDomainRequest} from '../lan-ingress/remote-domain.js'
++import {rateLimitMessage} from '../user/login-throttle.js'
++import {loginClientFromRequest} from './client-ip.js'
  
  type AppAuthRequest = {
  	appId: string
@@ -2459,7 +2997,7 @@ index 5a704cb..59139c1 100644
  	redirectPath: string
  }
  
-@@ -24,23 +26,32 @@ function requestString(request: express.Request, name: string) {
+@@ -24,23 +28,32 @@ function requestString(request: express.Request, name: string) {
  	return value
  }
  
@@ -2500,7 +3038,7 @@ index 5a704cb..59139c1 100644
  function hostWithPort(hostname: string, port: number) {
  	const host = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
  	return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`
-@@ -56,9 +67,14 @@ function formActionSource(protocol: string, hostname: string, port?: number | '*
+@@ -56,9 +69,14 @@ function formActionSource(protocol: string, hostname: string, port?: number | '*
  	return `${protocol}://${formattedHost}${port === undefined ? '' : `:${port}`}`
  }
  
@@ -2516,7 +3054,18 @@ index 5a704cb..59139c1 100644
  	const appId = request.query.app
  	if (request.query.origin === 'tor' && typeof appId === 'string' && /^[a-zA-Z0-9-]+$/.test(appId)) {
  		try {
-@@ -83,22 +99,27 @@ async function allowAppHandoffFormAction(umbreld: Umbreld, request: express.Requ
+@@ -68,6 +86,10 @@ async function appHandoffFormAction(umbreld: Umbreld, request: express.Request)
+ 		} catch {}
+ 	}
+ 
++	// On the remote domain every app has its own exact origin (handled above).
++	// Never fall back to a wildcard port there: keep helmet's 'self'.
++	if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return
++
+ 	return formActionSource(request.protocol, request.hostname, '*')
+ }
+ 
+@@ -83,22 +105,27 @@ async function allowAppHandoffFormAction(umbreld: Umbreld, request: express.Requ
  	}
  }
  
@@ -2551,6 +3100,1404 @@ index 5a704cb..59139c1 100644
  		params: {r: redirectPath, handoff},
  	}
  }
+@@ -119,6 +146,16 @@ export function rewriteAppAuthDevProxyPath(path: string) {
+ 
+ export default function createAppAuthRouter(umbreld: Umbreld) {
+ 	const router = express.Router()
++	// On the remote domain app login lives only on the auth host. The same
++	// router is reachable under /app-auth on every host, so refuse it on the
++	// dashboard host and anything else under the base domain.
++	router.use((request, response, next) => {
++		const remote = umbreld.lanIngress.remoteDomain
++		if (isRemoteDomainRequest(remote, request.hostname) && !isRemoteAuthRequest(remote, request.hostname)) {
++			return response.status(404).set('Cache-Control', 'no-store').json({error: 'Not found'})
++		}
++		next()
++	})
+ 	// App login finishes with a form POST from the dedicated auth port back to
+ 	// the app port. Helmet's default `form-action 'self'` blocks that because
+ 	// ports are part of an origin. Allow the current LAN hostname on another port,
+@@ -138,7 +175,10 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
+ 		next()
+ 	})
+ 
+-	router.get('/v1/account/accounts', async (_request, response) => {
++	router.get('/v1/account/accounts', async (request, response) => {
++		// Never list accounts to the internet; the remote login form asks for a
++		// username instead.
++		if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return response.json([])
+ 		if (!(await umbreld.user.exists())) return response.json([])
+ 		response.json(
+ 			(await umbreld.user.listAccounts()).map((account) => ({
+@@ -150,9 +190,20 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
+ 
+ 	router.post('/v1/account/login', async (request, response) => {
+ 		const userId = typeof request.body?.userId === 'string' ? request.body.userId : OWNER_USER_ID
++		const username = typeof request.body?.username === 'string' ? request.body.username.slice(0, 256) : undefined
+ 		const password = typeof request.body?.password === 'string' ? request.body.password : ''
+ 		const totpToken = typeof request.body?.totpToken === 'string' ? request.body.totpToken : undefined
+-		const validation = await umbreld.user.validateAccountLogin(userId, password, totpToken)
++		const validation = await umbreld.user.attemptAccountLogin({
++			userId,
++			username,
++			password,
++			totpToken,
++			client: loginClientFromRequest(umbreld, request),
++		})
++		if (!validation.valid && validation.reason === 'rate-limited') {
++			response.set('Retry-After', String(validation.retryAfterSeconds))
++			return response.status(429).json({error: {code: -32029, message: rateLimitMessage(validation.retryAfterSeconds)}})
++		}
+ 		if (!validation.valid) {
+ 			const message =
+ 				validation.reason === 'missing-totp'
+@@ -166,7 +217,7 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
+ 		let session
+ 		try {
+ 			session = await umbreld.auth.createSession({
+-				accountId: userId,
++				accountId: validation.userId,
+ 				userAgent: request.get('user-agent'),
+ 				expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
+ 			})
+@@ -210,6 +261,18 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
+ 	router.get('/v1/apps', async (request, response) => {
+ 		const appId = requestString(request, 'app')
+ 		if (!/^[a-zA-Z0-9-]+$/.test(appId)) return response.status(400).json({error: 'Invalid app'})
++		// On the remote domain answer the same for apps that are not installed,
++		// fail to load, or are not routed remotely, so the endpoint cannot be used
++		// to list what is installed.
++		if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) {
++			try {
++				if (!umbreld.lanIngress.remoteAppOrigin(appId)) throw new Error('Not routed')
++				const manifest = await umbreld.apps.getApp(appId).readManifest()
++				return response.json({id: manifest.id, name: manifest.name})
++			} catch {
++				return response.status(404).json({error: 'Not found'})
++			}
++		}
+ 		const manifest = await umbreld.apps.getApp(appId).readManifest()
+ 		response.json({id: manifest.id, name: manifest.name})
+ 	})
+diff --git a/packages/umbreld/source/modules/server/client-ip.ts b/packages/umbreld/source/modules/server/client-ip.ts
+new file mode 100644
+index 0000000..ba10780
+--- /dev/null
++++ b/packages/umbreld/source/modules/server/client-ip.ts
+@@ -0,0 +1,98 @@
++import net from 'node:net'
++import type http from 'node:http'
++
++import {isRemoteDomainRequest, type RemoteDomain} from '../lan-ingress/remote-domain.js'
++
++// Strip IPv6 brackets and the IPv4-mapped prefix. Returns undefined for
++// anything that is not an IP address.
++export function normaliseAddress(value: string | undefined) {
++	if (!value) return
++	let address = value.trim()
++	if (address.startsWith('[') && address.includes(']')) address = address.slice(1, address.indexOf(']'))
++	if (address.toLowerCase().startsWith('::ffff:') && net.isIPv4(address.slice(7))) address = address.slice(7)
++	return net.isIP(address) ? address : undefined
++}
++
++function isLoopback(address: string) {
++	return address === '::1' || (net.isIPv4(address) && address.startsWith('127.'))
++}
++
++const matchers = new WeakMap<string[], net.BlockList>()
++
++function trustedProxyList(entries: string[]) {
++	let list = matchers.get(entries)
++	if (list) return list
++	list = new net.BlockList()
++	for (const entry of entries) {
++		const [address, prefix] = entry.split('/')
++		const family = net.isIP(address ?? '')
++		if (!family) continue
++		const type = family === 4 ? 'ipv4' : 'ipv6'
++		if (prefix === undefined) list.addAddress(address!, type)
++		else list.addSubnet(address!, Number(prefix), type)
++	}
++	matchers.set(entries, list)
++	return list
++}
++
++export function isTrustedProxy(address: string, entries: string[]) {
++	return trustedProxyList(entries).check(address, net.isIPv4(address) ? 'ipv4' : 'ipv6')
++}
++
++function headerValues(value: string | string[] | undefined) {
++	if (value === undefined) return []
++	return (Array.isArray(value) ? value : [value]).flatMap((entry) => entry.split(','))
++}
++
++// The address of the client that made the request, for rate limiting.
++//
++// umbreld's own LAN ingress reaches the dashboard over loopback and appends the
++// peer it saw to X-Forwarded-For, so that one loopback hop is skipped.
++// Beyond that, forwarded addresses are
++// only believed for remote-domain requests and only from the reverse proxies
++// the owner trusts (loopback and private networks by default). A client that
++// talks to umbreld directly, or through an untrusted hop, is identified by
++// that hop's address and cannot choose its own.
++export function requestClientIp(
++	request: http.IncomingMessage,
++	remote: RemoteDomain | undefined,
++	hostname: string | undefined,
++): string {
++	const socketAddress = normaliseAddress(request.socket?.remoteAddress) ?? 'unknown'
++	const forwarded = headerValues(request.headers['x-forwarded-for']).map(normaliseAddress)
++	// Anything left of an unparseable entry cannot be attributed to a hop.
++	const lastInvalid = forwarded.lastIndexOf(undefined)
++	const chain = [...(forwarded.slice(lastInvalid + 1) as string[]), socketAddress]
++
++	// Skip umbreld's own loopback hop (LAN ingress to Express), once only: a
++	// loopback address further left came from a proxy on the same host.
++	let index = chain.length - 1
++	if (index > 0 && isLoopback(chain[index]!)) index--
++	if (!remote || !isRemoteDomainRequest(remote, hostname)) return chain[index]!
++
++	const trusted = (address: string) => isTrustedProxy(address, remote.trustedProxies)
++	if (!trusted(chain[index]!)) return chain[index]!
++
++	if (remote.clientIpHeader) {
++		const headerAddress = normaliseAddress(headerValues(request.headers[remote.clientIpHeader])[0])
++		if (headerAddress) return headerAddress
++	}
++
++	while (index > 0 && trusted(chain[index]!)) index--
++	return chain[index]!
++}
++
++type UmbreldLike = {lanIngress: {remoteDomain: RemoteDomain | undefined}}
++
++// Express requests: is this on the public remote domain?
++export function isRemoteDomainHttpRequest(umbreld: UmbreldLike, request: {hostname?: string}) {
++	return isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)
++}
++
++export function loginClientFromRequest(umbreld: UmbreldLike, request: http.IncomingMessage & {hostname?: string}) {
++	const remote = umbreld.lanIngress.remoteDomain
++	return {
++		ip: requestClientIp(request, remote, request.hostname),
++		remote: isRemoteDomainRequest(remote, request.hostname),
++	}
++}
+diff --git a/packages/umbreld/source/modules/server/client-ip.unit.test.ts b/packages/umbreld/source/modules/server/client-ip.unit.test.ts
+new file mode 100644
+index 0000000..9a5f061
+--- /dev/null
++++ b/packages/umbreld/source/modules/server/client-ip.unit.test.ts
+@@ -0,0 +1,125 @@
++import type http from 'node:http'
++
++import {describe, expect, test} from 'vitest'
++
++import {resolveRemoteDomain} from '../lan-ingress/remote-domain.js'
++import {isTrustedProxy, loginClientFromRequest, normaliseAddress, requestClientIp} from './client-ip.js'
++
++const remote = resolveRemoteDomain({enabled: true, baseDomain: 'example.com'})!
++
++function request(socket: string, headers: Record<string, string | string[]> = {}) {
++	return {socket: {remoteAddress: socket}, headers} as unknown as http.IncomingMessage
++}
++
++// What umbreld sees for a dashboard request: LAN ingress connects over
++// loopback and appends the peer it saw to X-Forwarded-For.
++function viaIngress(peer: string, clientXff?: string, extra: Record<string, string> = {}) {
++	return request('127.0.0.1', {'x-forwarded-for': clientXff ? `${clientXff}, ${peer}` : peer, ...extra})
++}
++
++describe('normaliseAddress()', () => {
++	test('accepts IPv4, IPv6, bracketed and mapped addresses', () => {
++		expect(normaliseAddress(' 203.0.113.5 ')).toBe('203.0.113.5')
++		expect(normaliseAddress('::ffff:203.0.113.5')).toBe('203.0.113.5')
++		expect(normaliseAddress('[2001:db8::1]')).toBe('2001:db8::1')
++		expect(normaliseAddress('2001:db8::1')).toBe('2001:db8::1')
++		expect(normaliseAddress('evil')).toBeUndefined()
++		expect(normaliseAddress('203.0.113.5:1234')).toBeUndefined()
++		expect(normaliseAddress(undefined)).toBeUndefined()
++	})
++
++	test('matches trusted proxy addresses and ranges', () => {
++		expect(isTrustedProxy('172.18.0.2', remote.trustedProxies)).toBe(true)
++		expect(isTrustedProxy('127.0.0.1', remote.trustedProxies)).toBe(true)
++		expect(isTrustedProxy('fd00::1', remote.trustedProxies)).toBe(true)
++		expect(isTrustedProxy('203.0.113.5', remote.trustedProxies)).toBe(false)
++		expect(isTrustedProxy('198.51.100.7', ['198.51.100.7'])).toBe(true)
++		expect(isTrustedProxy('198.51.100.8', ['198.51.100.7'])).toBe(false)
++	})
++})
++
++describe('requestClientIp() on the LAN', () => {
++	test('uses the peer LAN ingress saw and ignores client X-Forwarded-For', () => {
++		expect(requestClientIp(viaIngress('192.168.1.20'), remote, '192.168.1.10')).toBe('192.168.1.20')
++		expect(requestClientIp(viaIngress('192.168.1.20', '1.2.3.4'), remote, 'umbrel.local')).toBe('192.168.1.20')
++		expect(requestClientIp(viaIngress('192.168.1.20', '1.2.3.4'), undefined, 'umbrel.example.com')).toBe('192.168.1.20')
++	})
++
++	test('uses the socket address for direct connections', () => {
++		expect(requestClientIp(request('192.168.1.20', {'x-forwarded-for': '1.2.3.4'}), remote, '192.168.1.10')).toBe(
++			'192.168.1.20',
++		)
++		expect(requestClientIp(request('::ffff:192.168.1.20'), undefined, undefined)).toBe('192.168.1.20')
++	})
++
++	test('only skips umbreld own loopback hop', () => {
++		// A proxy on the same host connects to LAN ingress from loopback: stop there
++		expect(requestClientIp(viaIngress('127.0.0.1', '1.2.3.4'), remote, '192.168.1.10')).toBe('127.0.0.1')
++	})
++})
++
++describe('requestClientIp() on the remote domain', () => {
++	const host = 'umbrel.example.com'
++
++	test('trusts X-Forwarded-For from a private reverse proxy', () => {
++		// Browser 203.0.113.5 -> proxy 172.18.0.2 (appends the client) -> LAN ingress
++		expect(requestClientIp(viaIngress('172.18.0.2', '203.0.113.5'), remote, host)).toBe('203.0.113.5')
++		expect(requestClientIp(viaIngress('172.18.0.2', '203.0.113.5'), remote, 'nextcloud-umbrel.example.com')).toBe(
++			'203.0.113.5',
++		)
++	})
++
++	test('ignores entries a client prepends before the proxy', () => {
++		// The client sent "X-Forwarded-For: 10.9.9.9"; the proxy appended its real address
++		expect(requestClientIp(viaIngress('172.18.0.2', '10.9.9.9, 203.0.113.5'), remote, host)).toBe('203.0.113.5')
++		expect(requestClientIp(viaIngress('172.18.0.2', '1.1.1.1, 203.0.113.5'), remote, host)).toBe('203.0.113.5')
++	})
++
++	test('an untrusted peer cannot choose its address', () => {
++		expect(requestClientIp(viaIngress('203.0.113.9', '1.1.1.1'), remote, host)).toBe('203.0.113.9')
++		expect(
++			requestClientIp(
++				viaIngress('203.0.113.9', undefined, {'x-real-ip': '1.1.1.1'}),
++				{...remote, clientIpHeader: 'x-real-ip'},
++				host,
++			),
++		).toBe('203.0.113.9')
++	})
++
++	test('stops at an unparseable entry', () => {
++		expect(requestClientIp(viaIngress('172.18.0.2', '1.1.1.1, garbage, 10.0.0.3'), remote, host)).toBe('10.0.0.3')
++	})
++
++	test('honours a custom trusted proxy list', () => {
++		const custom = resolveRemoteDomain({
++			enabled: true,
++			baseDomain: 'example.com',
++			trustedProxies: ['198.51.100.7', '2001:db8::/32'],
++		})!
++		expect(requestClientIp(viaIngress('198.51.100.7', '203.0.113.5'), custom, host)).toBe('203.0.113.5')
++		// Private ranges are no longer trusted once the owner sets a list
++		expect(requestClientIp(viaIngress('172.18.0.2', '203.0.113.5'), custom, host)).toBe('172.18.0.2')
++	})
++
++	test('reads the configured client IP header only from a trusted proxy', () => {
++		const custom = resolveRemoteDomain({enabled: true, baseDomain: 'example.com', clientIpHeader: 'CF-Connecting-IP'})!
++		const headers = {'cf-connecting-ip': '203.0.113.5'}
++		expect(requestClientIp(viaIngress('172.18.0.2', '198.51.100.1', headers), custom, host)).toBe('203.0.113.5')
++		// Invalid header value: fall back to X-Forwarded-For
++		expect(requestClientIp(viaIngress('172.18.0.2', '198.51.100.1', {'cf-connecting-ip': 'nope'}), custom, host)).toBe(
++			'198.51.100.1',
++		)
++	})
++
++	test('loginClientFromRequest() reports the scope', () => {
++		const umbreld = {lanIngress: {remoteDomain: remote}}
++		const remoteRequest = Object.assign(viaIngress('172.18.0.2', '203.0.113.5'), {hostname: host})
++		const lanRequest = Object.assign(viaIngress('192.168.1.20'), {hostname: '192.168.1.10'})
++		expect(loginClientFromRequest(umbreld, remoteRequest)).toEqual({ip: '203.0.113.5', remote: true})
++		expect(loginClientFromRequest(umbreld, lanRequest)).toEqual({ip: '192.168.1.20', remote: false})
++		expect(loginClientFromRequest({lanIngress: {remoteDomain: undefined}}, remoteRequest)).toEqual({
++			ip: '172.18.0.2',
++			remote: false,
++		})
++	})
++})
+diff --git a/packages/umbreld/source/modules/server/index.ts b/packages/umbreld/source/modules/server/index.ts
+index 4b55e50..4af1e2c 100644
+--- a/packages/umbreld/source/modules/server/index.ts
++++ b/packages/umbreld/source/modules/server/index.ts
+@@ -42,6 +42,30 @@ export type AuthenticatedWebSocketRequest = http.IncomingMessage & {authPrincipa
+ 
+ export const MAX_WEBSOCKET_PAYLOAD_BYTES = 1024 * 1024
+ 
++// Security headers for every umbreld response. Exported for tests.
++export function securityHeaders({developmentMode}: {developmentMode?: boolean}) {
++	return [
++		helmet.contentSecurityPolicy({
++			directives: {
++				// Allow inline scripts ONLY in development for vite dev server
++				scriptSrc: developmentMode ? ["'self'", "'unsafe-inline'"] : null,
++				// Allow 3rd party app images (remove this if we serve them locally in the future)
++				// Also allow blob: URLs for images being uploaded in Files (since their thumbnails don't exist yet)
++				// and data: URLs for browser-rendered VM cursor images from noVNC.
++				imgSrc: ['*', 'blob:', 'data:'],
++				// Allow fetching data from our apps API (e.g., for Discover page in App Store)
++				connectSrc: ["'self'", 'https://apps.umbrel.com'],
++				// Allow plain text access over the local network
++				upgradeInsecureRequests: null,
++			},
++		}),
++		helmet.referrerPolicy({policy: 'no-referrer'}),
++		// Stop browsers guessing a script or stylesheet out of a response served
++		// with another type (dashboard, app-auth and file downloads alike)
++		helmet.noSniff(),
++	]
++}
++
+ // Safely wrapps async request handlers in logic to catch errors and pass them to the errror handling middleware
+ const asyncHandler = (
+ 	handler: (request: express.Request, response: express.Response, next: express.NextFunction) => Promise<any>,
+@@ -117,24 +141,8 @@ class Server {
+ 		// Setup cookie parser
+ 		this.app.use(cookieParser())
+ 
+-		// Security hardening, CSP
+-		this.app.use(
+-			helmet.contentSecurityPolicy({
+-				directives: {
+-					// Allow inline scripts ONLY in development for vite dev server
+-					scriptSrc: this.umbreld.developmentMode ? ["'self'", "'unsafe-inline'"] : null,
+-					// Allow 3rd party app images (remove this if we serve them locally in the future)
+-					// Also allow blob: URLs for images being uploaded in Files (since their thumbnails don't exist yet)
+-					// and data: URLs for browser-rendered VM cursor images from noVNC.
+-					imgSrc: ['*', 'blob:', 'data:'],
+-					// Allow fetching data from our apps API (e.g., for Discover page in App Store)
+-					connectSrc: ["'self'", 'https://apps.umbrel.com'],
+-					// Allow plain text access over the local network
+-					upgradeInsecureRequests: null,
+-				},
+-			}),
+-		)
+-		this.app.use(helmet.referrerPolicy({policy: 'no-referrer'}))
++		// Security hardening: CSP, referrer policy, nosniff
++		this.app.use(securityHeaders({developmentMode: this.umbreld.developmentMode}))
+ 		this.app.disable('x-powered-by')
+ 
+ 		// Attach the umbreld and logger instances so they're accessible to routes
+diff --git a/packages/umbreld/source/modules/server/remote-hardening.unit.test.ts b/packages/umbreld/source/modules/server/remote-hardening.unit.test.ts
+new file mode 100644
+index 0000000..d5e59dd
+--- /dev/null
++++ b/packages/umbreld/source/modules/server/remote-hardening.unit.test.ts
+@@ -0,0 +1,341 @@
++import http from 'node:http'
++import type {AddressInfo} from 'node:net'
++
++import bcrypt from 'bcryptjs'
++import cookieParser from 'cookie-parser'
++import express from 'express'
++import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi} from 'vitest'
++
++// The tRPC router imports the full daemon graph. Stub native modules that are
++// not needed here so this file also runs on machines without a native toolchain.
++vi.mock('drivelist', () => ({default: {list: async () => []}, list: async () => []}))
++vi.mock('node-pty', () => ({default: {}, spawn: () => {}}))
++
++import type Umbreld from '../../index.js'
++import {resolveRemoteDomain, type RemoteDomain} from '../lan-ingress/remote-domain.js'
++import User from '../user/user.js'
++import createAppAuthRouter, {appHandoffFormAction} from './app-auth.js'
++import {securityHeaders} from './index.js'
++import {batchedAuthProcedures, trpcExpressHandler} from './trpc/index.js'
++
++const REMOTE_HOST = 'umbrel.example.com'
++const AUTH_HOST = 'umbrel-auth.example.com'
++const LAN_HOST = '192.168.1.10'
++// LAN ingress appends the peer it saw; a reverse proxy in front appends the browser
++const REMOTE_XFF = '203.0.113.5, 172.18.0.2'
++const LAN_XFF = '192.168.1.20'
++
++const remote = resolveRemoteDomain({enabled: true, baseDomain: 'example.com'})!
++
++let ownerHash: string
++let aliceHash: string
++beforeAll(async () => {
++	ownerHash = await bcrypt.hash('owner-password', 4)
++	aliceHash = await bcrypt.hash('alice-password', 4)
++})
++
++type Data = Record<string, any>
++
++function createUmbreld(data: Data, remoteDomain: RemoteDomain | undefined = remote) {
++	const logger = {log: vi.fn(), error: vi.fn(), verbose: vi.fn(), createChildLogger: () => logger}
++	const umbreld = {
++		logger,
++		store: {
++			get: async (key: string) => key.split('.').reduce((value: any, part) => value?.[part], data),
++			set: async (key: string, value: unknown) => {
++				data[key] = value
++			},
++		},
++		lanIngress: {
++			remoteDomain,
++			remoteAppOrigin: (appId: string) =>
++				remoteDomain && appId === 'nextcloud' ? `https://nextcloud-umbrel.${remoteDomain.baseDomain}` : undefined,
++		},
++		apps: {
++			getApp: (appId: string) => ({
++				readManifest: async () => {
++					if (!['nextcloud', 'unrouted'].includes(appId)) throw new Error(`App ${appId} not found`)
++					return {id: appId, name: appId, port: 8080}
++				},
++				readHiddenService: async () => '',
++			}),
++		},
++		auth: {
++			sessionIssuanceRevision: () => 1,
++			createSession: vi.fn(async ({accountId}: {accountId: string}) => ({
++				appGatewayToken: 'gateway-token',
++				browserSessionToken: 'browser-token',
++				dashboardToken: `dashboard-${accountId}`,
++				expiresAt: Date.now() + 60_000,
++				principal: {sessionId: 'session'},
++			})),
++			issueAppHandoff: vi.fn(async () => 'handoff-token'),
++			authenticateApiCredentials: async (token: string) => {
++				if (token !== 'valid-token') throw new Error('Invalid token')
++				return {accountId: '0'}
++			},
++			revokeSession: vi.fn(),
++		},
++	} as unknown as Umbreld
++	umbreld.user = new User(umbreld)
++	return umbreld
++}
++
++let server: http.Server
++let port: number
++let umbreld: Umbreld
++
++beforeAll(async () => {
++	const app = express()
++	app.set('trust proxy', 'loopback')
++	app.use(cookieParser())
++	app.use(securityHeaders({developmentMode: false}))
++	// The tests swap umbreld per test; routes read it at request time
++	app.use((request, _response, next) => {
++		request.app.set('umbreld', umbreld)
++		request.app.set('logger', umbreld.logger)
++		next()
++	})
++	app.use('/app-auth', (request, response, next) => createAppAuthRouter(umbreld)(request, response, next))
++	app.use('/trpc', trpcExpressHandler)
++	server = http.createServer(app)
++	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++	port = (server.address() as AddressInfo).port
++})
++
++afterAll(async () => {
++	await new Promise((resolve) => server.close(resolve))
++})
++
++beforeEach(() => {
++	umbreld = createUmbreld({
++		user: {name: 'Owner', hashedPassword: ownerHash, totpUri: 'otpauth://totp/Umbrel?secret=JBSWY3DPEHPK3PXP'},
++		members: [{id: 'Alice', name: 'Alice', hashedPassword: aliceHash}],
++	})
++})
++
++afterEach(() => {
++	vi.restoreAllMocks()
++})
++
++type Response = {status: number; headers: http.IncomingHttpHeaders; body: any}
++
++function call(
++	method: 'GET' | 'POST',
++	path: string,
++	{host, xff, body, headers = {}}: {host: string; xff: string; body?: unknown; headers?: Record<string, string>},
++) {
++	return new Promise<Response>((resolve, reject) => {
++		const payload = body === undefined ? undefined : JSON.stringify(body)
++		const request = http.request(
++			{
++				host: '127.0.0.1',
++				port,
++				method,
++				path,
++				headers: {
++					host,
++					'x-forwarded-host': host,
++					'x-forwarded-for': xff,
++					...(payload ? {'content-type': 'application/json'} : {}),
++					...headers,
++				},
++			},
++			(response) => {
++				let text = ''
++				response.on('data', (chunk) => (text += chunk))
++				response.on('end', () => {
++					let parsed: unknown = text
++					try {
++						parsed = JSON.parse(text)
++					} catch {}
++					resolve({status: response.statusCode!, headers: response.headers, body: parsed})
++				})
++			},
++		)
++		request.on('error', reject)
++		request.end(payload)
++	})
++}
++
++const remoteGet = (path: string, headers?: Record<string, string>) =>
++	call('GET', path, {host: REMOTE_HOST, xff: REMOTE_XFF, headers})
++const lanGet = (path: string) => call('GET', path, {host: LAN_HOST, xff: LAN_XFF})
++const login = (host: string, xff: string, input: Record<string, unknown>) =>
++	call('POST', '/trpc/user.login', {host, xff, body: input})
++
++describe('tRPC batching', () => {
++	test('finds auth procedures in batched paths', () => {
++		expect(batchedAuthProcedures('/user.login')).toEqual([])
++		expect(batchedAuthProcedures('/user.login,user.login')).toEqual(['user.login', 'user.login'])
++		expect(batchedAuthProcedures('/user.exists,user.loginNative')).toEqual(['user.loginNative'])
++		expect(batchedAuthProcedures('/user.login%2Cuser.verifyPassword')).toEqual(['user.login', 'user.verifyPassword'])
++		expect(batchedAuthProcedures('/user.exists,user.listAccounts')).toEqual([])
++		expect(batchedAuthProcedures('/%E0%A4%A')).toEqual([])
++	})
++
++	test('refuses batches that carry password guesses, on the LAN too', async () => {
++		const body = {0: {password: 'a'}, 1: {password: 'b'}}
++		for (const host of [REMOTE_HOST, LAN_HOST]) {
++			const response = await call('POST', '/trpc/user.login,user.login?batch=1', {host, xff: LAN_XFF, body})
++			expect(response.status).toBe(400)
++			expect(response.body.error.message).toBe('Authentication procedures cannot be batched')
++		}
++		expect(umbreld.auth.createSession).not.toHaveBeenCalled()
++	})
++
++	test('still serves other batches', async () => {
++		const response = await lanGet('/trpc/user.exists,user.listAccounts?batch=1&input=%7B%7D')
++		expect(response.status).toBe(200)
++		expect(response.body[0].result.data).toBe(true)
++	})
++})
++
++describe('account enumeration on the remote domain', () => {
++	test('listAccounts is empty remotely unless signed in, and unchanged on the LAN', async () => {
++		expect((await remoteGet('/trpc/user.listAccounts')).body.result.data).toEqual([])
++		const signedIn = await remoteGet('/trpc/user.listAccounts', {authorization: 'Bearer valid-token'})
++		expect(signedIn.body.result.data.map((account: {userId: string}) => account.userId)).toEqual(['0', 'Alice'])
++		const lan = await lanGet('/trpc/user.listAccounts')
++		expect(lan.body.result.data.map((account: {name: string}) => account.name)).toEqual(['Owner', 'Alice'])
++	})
++
++	test('exists does not reveal setup state remotely', async () => {
++		umbreld = createUmbreld({})
++		expect((await remoteGet('/trpc/user.exists')).body.result.data).toBe(true)
++		expect((await lanGet('/trpc/user.exists')).body.result.data).toBe(false)
++	})
++
++	test('is2faEnabled does not reveal the owner 2FA state remotely', async () => {
++		expect((await remoteGet('/trpc/user.is2faEnabled')).body.result.data).toBe(false)
++		expect((await lanGet('/trpc/user.is2faEnabled')).body.result.data).toBe(true)
++	})
++
++	test('register is refused remotely', async () => {
++		umbreld = createUmbreld({})
++		const response = await call('POST', '/trpc/user.register', {
++			host: REMOTE_HOST,
++			xff: REMOTE_XFF,
++			body: {name: 'Mallory', password: 'password-password'},
++		})
++		expect(response.status).toBe(403)
++	})
++})
++
++describe('login backoff', () => {
++	test('remote login by typed username, case-insensitive', async () => {
++		const response = await login(REMOTE_HOST, REMOTE_XFF, {username: 'alice', password: 'alice-password'})
++		expect(response.status).toBe(200)
++		expect(response.body.result.data).toBe('dashboard-Alice')
++		expect(umbreld.auth.createSession).toHaveBeenCalledWith(expect.objectContaining({accountId: 'Alice'}))
++		const unknown = await login(REMOTE_HOST, REMOTE_XFF, {username: 'nobody', password: 'x'})
++		expect(unknown.status).toBe(401)
++		expect(unknown.body.error.message).toBe('Incorrect password')
++	})
++
++	test('locks the account remotely after five failures without locking the LAN', async () => {
++		for (let i = 0; i < 5; i++) {
++			const response = await login(REMOTE_HOST, REMOTE_XFF, {userId: 'Alice', password: 'wrong'})
++			expect(response.status).toBe(401)
++		}
++		// Even the right password is refused while locked
++		const locked = await login(REMOTE_HOST, REMOTE_XFF, {username: 'Alice', password: 'alice-password'})
++		expect(locked.status).toBe(429)
++		expect(locked.body.error.message).toMatch(/^Too many login attempts\. Try again in \d+ seconds?\.$/)
++		expect(Number(locked.headers['retry-after'])).toBeGreaterThan(0)
++		// A different internet address is refused too: the account key is shared
++		const otherIp = await login(REMOTE_HOST, '198.51.100.9, 172.18.0.2', {userId: 'Alice', password: 'alice-password'})
++		expect(otherIp.status).toBe(429)
++		// The LAN has its own account scope
++		const lan = await login(LAN_HOST, LAN_XFF, {userId: 'Alice', password: 'alice-password'})
++		expect(lan.status).toBe(200)
++	})
++
++	test('locks an IP that sprays account names', async () => {
++		for (let i = 0; i < 10; i++) {
++			expect((await login(REMOTE_HOST, REMOTE_XFF, {username: `user${i}`, password: 'x'})).status).toBe(401)
++		}
++		expect((await login(REMOTE_HOST, REMOTE_XFF, {username: 'Alice', password: 'alice-password'})).status).toBe(429)
++		// A client-chosen X-Forwarded-For entry does not escape the lock
++		expect(
++			(await login(REMOTE_HOST, `10.1.2.3, ${REMOTE_XFF}`, {username: 'Alice', password: 'alice-password'})).status,
++		).toBe(429)
++	})
++
++	test('a correct password awaiting its 2FA code does not count as a failure', async () => {
++		for (let i = 0; i < 8; i++) {
++			const response = await login(REMOTE_HOST, REMOTE_XFF, {password: 'owner-password'})
++			expect(response.body.error.message).toBe('Missing 2FA code')
++		}
++		expect(umbreld.user.loginThrottle.size).toBe(0)
++	})
++})
++
++describe('app-auth on the remote domain', () => {
++	const authGet = (path: string) => call('GET', path, {host: AUTH_HOST, xff: REMOTE_XFF})
++
++	test('does not list accounts remotely', async () => {
++		expect((await authGet('/app-auth/v1/account/accounts')).body).toEqual([])
++		expect((await lanGet('/app-auth/v1/account/accounts')).body).toHaveLength(2)
++	})
++
++	test('only answers on the auth host', async () => {
++		const response = await remoteGet('/app-auth/v1/account/accounts')
++		expect(response.status).toBe(404)
++		expect(
++			(await call('GET', '/app-auth/v1/apps?app=nextcloud', {host: 'x.example.com', xff: REMOTE_XFF})).status,
++		).toBe(404)
++	})
++
++	test('/v1/apps answers 404 alike for missing and unrouted apps', async () => {
++		expect((await authGet('/app-auth/v1/apps?app=nextcloud')).body).toEqual({id: 'nextcloud', name: 'nextcloud'})
++		expect((await authGet('/app-auth/v1/apps?app=unrouted')).status).toBe(404)
++		expect((await authGet('/app-auth/v1/apps?app=missing')).status).toBe(404)
++		// LAN keeps upstream behaviour
++		expect((await lanGet('/app-auth/v1/apps?app=unrouted')).status).toBe(200)
++	})
++
++	test('app login is throttled with a 429 and Retry-After', async () => {
++		const appLogin = (password: string) =>
++			call('POST', '/app-auth/v1/account/login?origin=remote&app=nextcloud&path=/', {
++				host: AUTH_HOST,
++				xff: REMOTE_XFF,
++				body: {username: 'alice', password},
++			})
++		expect((await appLogin('alice-password')).status).toBe(200)
++		expect(umbreld.auth.createSession).toHaveBeenCalledWith(expect.objectContaining({accountId: 'Alice'}))
++		for (let i = 0; i < 5; i++) expect((await appLogin('wrong')).status).toBe(401)
++		const locked = await appLogin('alice-password')
++		expect(locked.status).toBe(429)
++		expect(locked.body.error.code).toBe(-32029)
++		expect(Number(locked.headers['retry-after'])).toBeGreaterThan(0)
++	})
++
++	test('never widens form-action to a wildcard port on the remote domain', async () => {
++		const request = (hostname: string, query: Record<string, string>) =>
++			({hostname, protocol: 'https', query}) as unknown as express.Request
++		await expect(appHandoffFormAction(umbreld, request(AUTH_HOST, {origin: 'host', app: 'nextcloud'}))).resolves.toBe(
++			undefined,
++		)
++		await expect(appHandoffFormAction(umbreld, request(AUTH_HOST, {}))).resolves.toBeUndefined()
++		await expect(appHandoffFormAction(umbreld, request(LAN_HOST, {origin: 'host', app: 'nextcloud'}))).resolves.toBe(
++			`https://${LAN_HOST}:*`,
++		)
++		const response = await authGet('/app-auth/v1/account/accounts')
++		expect(response.headers['content-security-policy']).not.toMatch(/:\*/)
++	})
++})
++
++describe('security headers', () => {
++	test('sends nosniff and the strict referrer policy', async () => {
++		for (const response of [await remoteGet('/trpc/user.exists'), await authGet()]) {
++			expect(response.headers['x-content-type-options']).toBe('nosniff')
++			expect(response.headers['referrer-policy']).toBe('no-referrer')
++			expect(response.headers['content-security-policy']).toContain("form-action 'self'")
++		}
++	})
++
++	function authGet() {
++		return call('GET', '/app-auth/v1/account/accounts', {host: AUTH_HOST, xff: REMOTE_XFF})
++	}
++})
+diff --git a/packages/umbreld/source/modules/server/trpc/index.ts b/packages/umbreld/source/modules/server/trpc/index.ts
+index 55c8f71..19ca7f2 100644
+--- a/packages/umbreld/source/modules/server/trpc/index.ts
++++ b/packages/umbreld/source/modules/server/trpc/index.ts
+@@ -1,3 +1,4 @@
++import type {RequestHandler} from 'express'
+ import {createExpressMiddleware} from '@trpc/server/adapters/express'
+ import {applyWSSHandler} from '@trpc/server/adapters/ws'
+ 
+@@ -71,7 +72,7 @@ export function createInternalTrpcCaller(umbreld: Umbreld): InternalTrpcCaller {
+ // Errors that are expected in Docker and would only flood the logs
+ const isQuietError = (error: {cause?: unknown}) => error.cause instanceof CpuTemperatureUnavailableError
+ 
+-export const trpcExpressHandler = createExpressMiddleware({
++const trpcExpressMiddleware = createExpressMiddleware({
+ 	router: appRouter,
+ 	createContext: createContextExpress,
+ 	onError({error, ctx}) {
+@@ -80,6 +81,47 @@ export const trpcExpressHandler = createExpressMiddleware({
+ 	},
+ })
+ 
++// Procedures that check a password or hand out credentials. tRPC's HTTP
++// batching (`/trpc/a,b,c?batch=1`) would let one request carry many password
++// guesses, so these are refused inside a batch. The UI never batches.
++export const AUTH_PROCEDURES = new Set([
++	'user.login',
++	'user.loginNative',
++	'user.refreshNativeAccess',
++	'user.register',
++	'user.verifyPassword',
++	'user.changePassword',
++	'user.enable2fa',
++	'user.disable2fa',
++])
++
++// The auth procedures in a batched request path, e.g. '/user.login,user.login'.
++// Single calls return an empty list.
++export function batchedAuthProcedures(path: string) {
++	let decoded: string
++	try {
++		decoded = decodeURIComponent(path)
++	} catch {
++		return []
++	}
++	const procedures = decoded.replace(/^\/+/, '').split(',')
++	if (procedures.length < 2) return []
++	return procedures.filter((procedure) => AUTH_PROCEDURES.has(procedure.trim()))
++}
++
++export const trpcExpressHandler: RequestHandler = (request, response, next) => {
++	if (batchedAuthProcedures(request.path).length > 0) {
++		return response.status(400).json({
++			error: {
++				code: -32600,
++				message: 'Authentication procedures cannot be batched',
++				data: {code: 'BAD_REQUEST', httpStatus: 400},
++			},
++		})
++	}
++	return trpcExpressMiddleware(request, response, next)
++}
++
+ export const trpcWssHandler = ({
+ 	wss,
+ 	umbreld,
+diff --git a/packages/umbreld/source/modules/user/login-throttle.ts b/packages/umbreld/source/modules/user/login-throttle.ts
+new file mode 100644
+index 0000000..3fabd6f
+--- /dev/null
++++ b/packages/umbreld/source/modules/user/login-throttle.ts
+@@ -0,0 +1,136 @@
++// Exponential backoff for password logins, keyed per account and per client
++// IP. Attempts are counted when they start, before the password hash is
++// checked, so parallel guesses cannot race past the limit, and a locked key is
++// refused without running bcrypt at all.
++
++export type ThrottlePolicy = {
++	// Failures allowed before the first lockout
++	freeFailures: number
++	// Length of the first lockout; each further failure doubles it
++	baseDelayMs: number
++	maxDelayMs: number
++}
++
++export const ACCOUNT_POLICY: ThrottlePolicy = {freeFailures: 5, baseDelayMs: 2_000, maxDelayMs: 15 * 60_000}
++export const IP_POLICY: ThrottlePolicy = {freeFailures: 10, baseDelayMs: 2_000, maxDelayMs: 60 * 60_000}
++// A key with no failure for this long starts from zero again
++export const FORGET_AFTER_MS = 24 * 60 * 60_000
++export const MAX_ENTRIES = 10_000
++
++type Entry = {failures: number; lockedUntil: number; lastFailureAt: number}
++
++export type ThrottleKey = {key: string; policy: ThrottlePolicy}
++
++export type ThrottleAttempt =
++	| {allowed: false; retryAfterMs: number}
++	| {
++			allowed: true
++			// The attempt succeeded: forget every key's failures
++			succeed(): void
++			// The attempt neither succeeded nor failed (correct password, 2FA code
++			// still to come): undo its count
++			cancel(): void
++	  }
++
++export const rateLimitMessage = (retryAfterSeconds: number) =>
++	`Too many login attempts. Try again in ${retryAfterSeconds} second${retryAfterSeconds === 1 ? '' : 's'}.`
++
++export function lockoutMs(policy: ThrottlePolicy, failures: number) {
++	if (failures < policy.freeFailures) return 0
++	const doublings = Math.min(failures - policy.freeFailures, 30)
++	return Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** doublings)
++}
++
++export default class LoginThrottle {
++	#entries = new Map<string, Entry>()
++	#now: () => number
++	#maxEntries: number
++
++	constructor({now = Date.now, maxEntries = MAX_ENTRIES}: {now?: () => number; maxEntries?: number} = {}) {
++		this.#now = now
++		this.#maxEntries = maxEntries
++	}
++
++	get size() {
++		return this.#entries.size
++	}
++
++	#get(key: string, now: number) {
++		const entry = this.#entries.get(key)
++		if (entry && now - entry.lastFailureAt > FORGET_AFTER_MS) {
++			this.#entries.delete(key)
++			return
++		}
++		return entry
++	}
++
++	#set(key: string, entry: Entry, now: number) {
++		this.#entries.delete(key)
++		if (this.#entries.size >= this.#maxEntries) this.#prune(now)
++		this.#entries.set(key, entry)
++	}
++
++	#prune(now: number) {
++		for (const [key, entry] of this.#entries) {
++			if (now - entry.lastFailureAt > FORGET_AFTER_MS) this.#entries.delete(key)
++		}
++		// Still full: drop the least recently failed keys (Map keeps insertion order)
++		for (const key of this.#entries.keys()) {
++			if (this.#entries.size < this.#maxEntries) break
++			this.#entries.delete(key)
++		}
++	}
++
++	// Milliseconds until any of these keys accepts another attempt, or 0
++	retryAfterMs(keys: ThrottleKey[]) {
++		const now = this.#now()
++		return Math.max(0, ...keys.map(({key}) => (this.#get(key, now)?.lockedUntil ?? 0) - now))
++	}
++
++	begin(keys: ThrottleKey[]): ThrottleAttempt {
++		const retryAfterMs = this.retryAfterMs(keys)
++		if (retryAfterMs > 0) return {allowed: false, retryAfterMs}
++
++		const now = this.#now()
++		const previous = new Map<string, Entry | undefined>()
++		for (const {key, policy} of keys) {
++			const entry = this.#get(key, now)
++			previous.set(key, entry && {...entry})
++			const failures = (entry?.failures ?? 0) + 1
++			const delay = lockoutMs(policy, failures)
++			this.#set(key, {failures, lastFailureAt: now, lockedUntil: delay ? now + delay : 0}, now)
++		}
++
++		let settled = false
++		return {
++			allowed: true,
++			succeed: () => {
++				if (settled) return
++				settled = true
++				for (const {key} of keys) this.#entries.delete(key)
++			},
++			cancel: () => {
++				if (settled) return
++				settled = true
++				for (const {key, policy} of keys) {
++					const entry = this.#entries.get(key)
++					if (!entry) continue
++					const before = previous.get(key)
++					// Nothing else touched the key since: put it back exactly
++					if (entry.failures === (before?.failures ?? 0) + 1 && entry.lastFailureAt === now) {
++						if (before) this.#entries.set(key, before)
++						else this.#entries.delete(key)
++						continue
++					}
++					const failures = Math.max(0, entry.failures - 1)
++					const delay = lockoutMs(policy, failures)
++					this.#entries.set(key, {...entry, failures, lockedUntil: delay ? entry.lastFailureAt + delay : 0})
++				}
++			},
++		}
++	}
++
++	clear() {
++		this.#entries.clear()
++	}
++}
+diff --git a/packages/umbreld/source/modules/user/login-throttle.unit.test.ts b/packages/umbreld/source/modules/user/login-throttle.unit.test.ts
+new file mode 100644
+index 0000000..9ba96a9
+--- /dev/null
++++ b/packages/umbreld/source/modules/user/login-throttle.unit.test.ts
+@@ -0,0 +1,171 @@
++import {describe, expect, test} from 'vitest'
++
++import LoginThrottle, {
++	ACCOUNT_POLICY,
++	FORGET_AFTER_MS,
++	IP_POLICY,
++	lockoutMs,
++	rateLimitMessage,
++	type ThrottleKey,
++} from './login-throttle.js'
++
++function clock(start = 1_000_000) {
++	const state = {now: start}
++	return {state, now: () => state.now}
++}
++
++const account = (key = 'account:remote:0'): ThrottleKey => ({key, policy: ACCOUNT_POLICY})
++const ip = (key = 'ip:203.0.113.5'): ThrottleKey => ({key, policy: IP_POLICY})
++
++// Record one failed attempt (begin without succeed or cancel)
++function fail(throttle: LoginThrottle, keys: ThrottleKey[]) {
++	const attempt = throttle.begin(keys)
++	expect(attempt.allowed).toBe(true)
++}
++
++describe('lockoutMs()', () => {
++	test('allows the free failures, then doubles up to the cap', () => {
++		expect(lockoutMs(ACCOUNT_POLICY, 4)).toBe(0)
++		expect(lockoutMs(ACCOUNT_POLICY, 5)).toBe(2_000)
++		expect(lockoutMs(ACCOUNT_POLICY, 6)).toBe(4_000)
++		expect(lockoutMs(ACCOUNT_POLICY, 10)).toBe(64_000)
++		expect(lockoutMs(ACCOUNT_POLICY, 50)).toBe(15 * 60_000)
++		expect(lockoutMs(IP_POLICY, 9)).toBe(0)
++		expect(lockoutMs(IP_POLICY, 10)).toBe(2_000)
++		expect(lockoutMs(IP_POLICY, 1_000)).toBe(60 * 60_000)
++	})
++
++	test('formats the retry message', () => {
++		expect(rateLimitMessage(1)).toBe('Too many login attempts. Try again in 1 second.')
++		expect(rateLimitMessage(30)).toBe('Too many login attempts. Try again in 30 seconds.')
++	})
++})
++
++describe('LoginThrottle', () => {
++	test('locks an account after the free failures and backs off exponentially', () => {
++		const {state, now} = clock()
++		const throttle = new LoginThrottle({now})
++		for (let i = 0; i < 4; i++) fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++		fail(throttle, [account()]) // 5th failure: 2s
++		expect(throttle.begin([account()])).toEqual({allowed: false, retryAfterMs: 2_000})
++
++		state.now += 2_000
++		fail(throttle, [account()]) // 6th failure: 4s
++		expect(throttle.retryAfterMs([account()])).toBe(4_000)
++		state.now += 3_999
++		expect(throttle.begin([account()]).allowed).toBe(false)
++		state.now += 1
++		fail(throttle, [account()]) // 7th: 8s
++		expect(throttle.retryAfterMs([account()])).toBe(8_000)
++	})
++
++	test('a refused attempt does not extend the lockout', () => {
++		const {state, now} = clock()
++		const throttle = new LoginThrottle({now})
++		for (let i = 0; i < 5; i++) fail(throttle, [account()])
++		for (let i = 0; i < 100; i++) expect(throttle.begin([account()]).allowed).toBe(false)
++		state.now += 2_000
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++	})
++
++	test('counts attempts up front so parallel guesses cannot race past the limit', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		// Five attempts start before any finishes: the fifth already locks
++		const attempts = Array.from({length: 6}, () => throttle.begin([account()]))
++		expect(attempts.slice(0, 5).every((attempt) => attempt.allowed)).toBe(true)
++		expect(attempts[5]!.allowed).toBe(false)
++	})
++
++	test('success clears the counters', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		for (let i = 0; i < 4; i++) fail(throttle, [account(), ip()])
++		const attempt = throttle.begin([account(), ip()])
++		if (!attempt.allowed) throw new Error('expected allowed')
++		attempt.succeed()
++		expect(throttle.size).toBe(0)
++		for (let i = 0; i < 4; i++) fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++	})
++
++	test('cancel undoes an attempt that neither failed nor succeeded', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		for (let i = 0; i < 4; i++) fail(throttle, [account()])
++		for (let i = 0; i < 10; i++) {
++			const attempt = throttle.begin([account()])
++			if (!attempt.allowed) throw new Error('expected allowed')
++			attempt.cancel()
++			attempt.cancel() // idempotent
++		}
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++		fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(2_000)
++
++		const fresh = new LoginThrottle({now: clock().now})
++		const attempt = fresh.begin([account()])
++		if (!attempt.allowed) throw new Error('expected allowed')
++		attempt.cancel()
++		expect(fresh.size).toBe(0)
++	})
++
++	test('cancel after other attempts only removes its own count', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		const first = throttle.begin([account()])
++		for (let i = 0; i < 3; i++) fail(throttle, [account()]) // 4 counted
++		if (!first.allowed) throw new Error('expected allowed')
++		first.cancel() // back to 3
++		fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++		fail(throttle, [account()]) // 5th failure locks
++		expect(throttle.retryAfterMs([account()])).toBe(2_000)
++	})
++
++	test('keys are independent: other accounts and IPs are unaffected', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		for (let i = 0; i < 5; i++) fail(throttle, [account('account:remote:0'), ip('ip:203.0.113.5')])
++		expect(throttle.retryAfterMs([account('account:remote:0')])).toBeGreaterThan(0)
++		// The LAN scope of the same account still works
++		expect(throttle.retryAfterMs([account('account:local:0')])).toBe(0)
++		// The IP is not locked yet (10 free failures)
++		expect(throttle.retryAfterMs([ip('ip:203.0.113.5')])).toBe(0)
++		// One locked key is enough to refuse
++		expect(throttle.begin([account('account:remote:0'), ip('ip:198.51.100.1')]).allowed).toBe(false)
++	})
++
++	test('an IP spraying many account names is locked', () => {
++		const throttle = new LoginThrottle({now: clock().now})
++		for (let i = 0; i < 10; i++) fail(throttle, [account(`account:remote:unknown:user${i}`), ip()])
++		const attempt = throttle.begin([account('account:remote:unknown:new'), ip()])
++		expect(attempt).toEqual({allowed: false, retryAfterMs: 2_000})
++	})
++
++	test('forgets failures after a quiet day', () => {
++		const {state, now} = clock()
++		const throttle = new LoginThrottle({now})
++		for (let i = 0; i < 20; i++) {
++			fail(throttle, [account()])
++			state.now += 16 * 60_000
++		}
++		expect(throttle.retryAfterMs([account()])).toBe(0) // capped at 15 min and elapsed
++		fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(15 * 60_000)
++		state.now += FORGET_AFTER_MS + 1
++		fail(throttle, [account()])
++		expect(throttle.retryAfterMs([account()])).toBe(0)
++	})
++
++	test('stays bounded, dropping expired keys and then the oldest', () => {
++		const {state, now} = clock()
++		const throttle = new LoginThrottle({now, maxEntries: 3})
++		fail(throttle, [ip('ip:a')])
++		state.now += FORGET_AFTER_MS + 1
++		fail(throttle, [ip('ip:b')])
++		fail(throttle, [ip('ip:c')])
++		fail(throttle, [ip('ip:d')]) // prunes expired a
++		expect(throttle.size).toBe(3)
++		fail(throttle, [ip('ip:e')]) // drops oldest b
++		expect(throttle.size).toBe(3)
++		for (let i = 0; i < 9; i++) fail(throttle, [ip('ip:e')])
++		expect(throttle.retryAfterMs([ip('ip:e')])).toBe(2_000)
++	})
++})
+diff --git a/packages/umbreld/source/modules/user/routes.ts b/packages/umbreld/source/modules/user/routes.ts
+index 301a720..8f4f88f 100644
+--- a/packages/umbreld/source/modules/user/routes.ts
++++ b/packages/umbreld/source/modules/user/routes.ts
+@@ -19,15 +19,61 @@ import type {Context} from '../server/trpc/context.js'
+ import {privateProcedure, privateProcedureWithMembers, publicProcedure, router} from '../server/trpc/trpc.js'
+ import {accountAvatarUrl, serializeAccountAvatar} from './avatar-api.js'
+ import {OWNER_USER_ID} from './constants.js'
+-import type {AccountLoginValidation} from './user.js'
++import {loginClientFromRequest, isRemoteDomainHttpRequest} from '../server/client-ip.js'
++import {rateLimitMessage} from './login-throttle.js'
++import type {AccountLoginAttempt} from './user.js'
+ import {isWallpaperId, resolveWallpaperAppearance} from './wallpapers.js'
+ 
+-const loginErrorMessage = (reason: Extract<AccountLoginValidation, {valid: false}>['reason']) => {
++const loginErrorMessage = (reason: Exclude<Extract<AccountLoginAttempt, {valid: false}>['reason'], 'rate-limited'>) => {
+ 	if (reason === 'missing-totp') return 'Missing 2FA code'
+ 	if (reason === 'incorrect-totp') return 'Incorrect 2FA code'
+ 	return 'Incorrect password'
+ }
+ 
++// Shared by login and loginNative. Throws the tRPC error for a failed attempt.
++async function attemptLogin(
++	ctx: Context,
++	input: {userId: string; username?: string; password: string; totpToken?: string},
++) {
++	const result = await ctx.user.attemptAccountLogin({
++		userId: input.userId,
++		username: input.username,
++		password: input.password,
++		totpToken: input.totpToken,
++		client: loginClientFromRequest(ctx.umbreld, ctx.request!),
++	})
++	if (result.valid) return result
++	if (result.reason === 'rate-limited') {
++		ctx.response!.set('Retry-After', String(result.retryAfterSeconds))
++		throw new TRPCError({code: 'TOO_MANY_REQUESTS', message: rateLimitMessage(result.retryAfterSeconds)})
++	}
++	throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(result.reason)})
++}
++
++// Whether the request is on the public remote domain. WebSocket calls are
++// always authenticated, so only HTTP requests need the stricter answers.
++function isRemoteRequest(ctx: Context) {
++	return ctx.transport === 'express' && !!ctx.request && isRemoteDomainHttpRequest(ctx.umbreld, ctx.request)
++}
++
++// Whether the caller presented valid credentials. Unlike
++// resolveOptionalAccountId this never falls back to the owner.
++async function hasValidCredentials(ctx: Context) {
++	try {
++		if (ctx.transport === 'ws') {
++			if (!ctx.principal) return false
++			await ctx.umbreld.auth.validatePrincipal(ctx.principal)
++			return true
++		}
++		const [scheme, token] = ctx.request?.headers.authorization?.split(' ') ?? []
++		if (scheme?.toLowerCase() !== 'bearer' || !token || !ctx.request) return false
++		await ctx.umbreld.auth.authenticateApiCredentials(token, browserSessionTokenFromRequest(ctx.request))
++		return true
++	} catch {
++		return false
++	}
++}
++
+ // Public cosmetic endpoints are used both before login and from authenticated
+ // settings screens. Resolve a valid account when credentials are available,
+ // otherwise fall back to the owner. This must never be used for authorization.
+@@ -67,6 +113,11 @@ export default router({
+ 			}),
+ 		)
+ 		.mutation(async ({ctx, input}) => {
++			// Onboarding only happens on the LAN. The remote domain is configured by
++			// an existing owner, so a register call there is never legitimate.
++			if (isRemoteRequest(ctx)) {
++				throw new TRPCError({code: 'FORBIDDEN', message: 'Registration is not available on the remote domain'})
++			}
+ 			if (await ctx.user.exists()) {
+ 				throw new TRPCError({code: 'UNAUTHORIZED', message: 'Attempted to register when user is already registered'})
+ 			}
+@@ -89,10 +140,15 @@ export default router({
+ 			return ctx.user.register(input.name, input.password, input.language)
+ 		}),
+ 
+-	exists: publicProcedure.query(async ({ctx}) => ctx.user.exists()),
++	// The remote domain only works once an owner exists, so it always says yes
++	// there rather than reveal setup state to the internet.
++	exists: publicProcedure.query(async ({ctx}) => (isRemoteRequest(ctx) ? true : ctx.user.exists())),
+ 
+ 	// Public so the login and app-auth account pickers can render before auth.
++	// On the remote domain the list is only given to signed-in callers; the
++	// login screen then asks for a username instead.
+ 	listAccounts: publicProcedure.query(async ({ctx}) => {
++		if (isRemoteRequest(ctx) && !(await hasValidCredentials(ctx))) return []
+ 		if (!(await ctx.user.exists())) return []
+ 		return (await ctx.user.listAccounts()).map((account) => ({
+ 			...serializeAccountAvatar(account),
+@@ -104,6 +160,9 @@ export default router({
+ 		.input(
+ 			z.object({
+ 				userId: z.string().default(OWNER_USER_ID),
++				// Typed account name, used where the account list is hidden. Takes
++				// precedence over userId when present.
++				username: z.string().max(256).optional(),
+ 				password: z.string(),
+ 				totpToken: z.string().optional(),
+ 			}),
+@@ -112,14 +171,11 @@ export default router({
+ 			if (!ctx.request || !ctx.response) {
+ 				throw new TRPCError({code: 'METHOD_NOT_SUPPORTED', message: 'HTTP transport required'})
+ 			}
+-			const validation = await ctx.user.validateAccountLogin(input.userId, input.password, input.totpToken)
+-			if (!validation.valid) {
+-				throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(validation.reason)})
+-			}
++			const validation = await attemptLogin(ctx, input)
+ 
+ 			const session = await ctx.umbreld.auth
+ 				.createSession({
+-					accountId: input.userId,
++					accountId: validation.userId,
+ 					userAgent: ctx.request!.get('user-agent'),
+ 					expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
+ 				})
+@@ -138,6 +194,9 @@ export default router({
+ 		.input(
+ 			z.object({
+ 				userId: z.string().default(OWNER_USER_ID),
++				// Typed account name, used where the account list is hidden. Takes
++				// precedence over userId when present.
++				username: z.string().max(256).optional(),
+ 				password: z.string(),
+ 				totpToken: z.string().optional(),
+ 				client: nativeClientSchema,
+@@ -147,14 +206,11 @@ export default router({
+ 			if (!ctx.request || !ctx.response) {
+ 				throw new TRPCError({code: 'METHOD_NOT_SUPPORTED', message: 'HTTP transport required'})
+ 			}
+-			const validation = await ctx.user.validateAccountLogin(input.userId, input.password, input.totpToken)
+-			if (!validation.valid) {
+-				throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(validation.reason)})
+-			}
++			const validation = await attemptLogin(ctx, input)
+ 
+ 			const session = await ctx.umbreld.auth
+ 				.createNativeSession({
+-					accountId: input.userId,
++					accountId: validation.userId,
+ 					nativeClient: input.client,
+ 					userAgent: ctx.request!.get('user-agent'),
+ 					expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
+@@ -375,9 +431,11 @@ export default router({
+ 			return ctx.user.enable2faForAccount(accountId, input.totpUri)
+ 		}),
+ 
+-	is2faEnabled: publicProcedure.query(async ({ctx}) =>
+-		ctx.user.is2faEnabledForAccount(await resolveOptionalAccountId(ctx)),
+-	),
++	is2faEnabled: publicProcedure.query(async ({ctx}) => {
++		// Unauthenticated remote callers learn nothing about the owner's 2FA
++		if (isRemoteRequest(ctx) && !(await hasValidCredentials(ctx))) return false
++		return ctx.user.is2faEnabledForAccount(await resolveOptionalAccountId(ctx))
++	}),
+ 
+ 	disable2fa: privateProcedureWithMembers.input(z.object({totpToken: z.string()})).mutation(async ({ctx, input}) => {
+ 		const accountId = ctx.principal!.accountId
+diff --git a/packages/umbreld/source/modules/user/user.ts b/packages/umbreld/source/modules/user/user.ts
+index fed8eeb..61d1bbd 100644
+--- a/packages/umbreld/source/modules/user/user.ts
++++ b/packages/umbreld/source/modules/user/user.ts
+@@ -8,6 +8,7 @@ import type {ViewPreferences} from '../files/files.js'
+ import * as totp from '../utilities/totp.js'
+ import {removeAccountAvatarDirectory} from './avatar.js'
+ import {OWNER_USER_ID} from './constants.js'
++import LoginThrottle, {ACCOUNT_POLICY, IP_POLICY} from './login-throttle.js'
+ 
+ export type Member = {
+ 	id: string
+@@ -54,6 +55,22 @@ export type AccountLoginValidation =
+ 	| {valid: true; sessionIssuanceRevision: number}
+ 	| {valid: false; reason: 'incorrect-password' | 'missing-totp' | 'incorrect-totp'}
+ 
++export type LoginClient = {
++	// Best known client address (see server/client-ip.ts)
++	ip: string
++	// The request came in on the public remote domain. Remote failures count
++	// against separate account keys so internet traffic cannot lock out the LAN.
++	remote: boolean
++}
++
++export type AccountLoginAttempt =
++	| (AccountLoginValidation & {userId: string})
++	| {valid: false; reason: 'rate-limited'; retryAfterSeconds: number}
++
++// Compared against when the account does not exist, so an unknown name costs
++// the same bcrypt time as a wrong password. Hash of a random string.
++const DUMMY_PASSWORD_HASH = '$2b$12$YEDQnm3EYfCA4.rE1soTd.bbqoXhcbtfVUxgj9K5YtoimywVDCSBS'
++
+ const isActiveMember = (member: MemberRecord): member is Member => !('deleted' in member)
+ const isDeletedMember = (member: MemberRecord): member is DeletedMember => 'deleted' in member
+ 
+@@ -61,6 +78,7 @@ export default class User {
+ 	#store: Umbreld['store']
+ 	logger: Umbreld['logger']
+ 	#umbreld: Umbreld
++	loginThrottle = new LoginThrottle()
+ 	constructor(umbreld: Umbreld) {
+ 		this.#store = umbreld.store
+ 		const {name} = this.constructor
+@@ -450,7 +468,11 @@ export default class User {
+ 		const sessionIssuanceRevision = this.#umbreld.auth.sessionIssuanceRevision(userId)
+ 		const account = userId === OWNER_USER_ID ? await this.get() : await this.getMember(userId)
+ 
+-		if (!account?.hashedPassword || !(await bcrypt.compare(password, account.hashedPassword))) {
++		if (!account?.hashedPassword) {
++			await bcrypt.compare(password, DUMMY_PASSWORD_HASH)
++			return {valid: false, reason: 'incorrect-password'}
++		}
++		if (!(await bcrypt.compare(password, account.hashedPassword))) {
+ 			return {valid: false, reason: 'incorrect-password'}
+ 		}
+ 		if (account.totpUri) {
+@@ -461,6 +483,67 @@ export default class User {
+ 		return {valid: true, sessionIssuanceRevision}
+ 	}
+ 
++	// Find the account a typed username refers to: the owner's or a member's
++	// display name, or a member's id, compared case-insensitively. Used where
++	// the account list is hidden (the remote domain).
++	async resolveLoginUsername(username: string): Promise<string | undefined> {
++		const wanted = username.trim().toLowerCase()
++		if (!wanted) return OWNER_USER_ID
++		const owner = await this.get()
++		if (owner?.name?.trim().toLowerCase() === wanted) return OWNER_USER_ID
++		const members = await this.listMembers()
++		return (
++			members.find((member) => member.name.trim().toLowerCase() === wanted)?.id ??
++			members.find((member) => member.id.toLowerCase() === wanted)?.id
++		)
++	}
++
++	// Validate a login with backoff. Every password login path (tRPC login and
++	// loginNative, and the app-auth form) goes through here.
++	async attemptAccountLogin({
++		userId,
++		username,
++		password,
++		totpToken,
++		client,
++	}: {
++		userId?: string
++		username?: string
++		password: string
++		totpToken?: string
++		client: LoginClient
++	}): Promise<AccountLoginAttempt> {
++		const typedName = username?.trim()
++		const resolvedUserId = typedName ? await this.resolveLoginUsername(typedName) : (userId ?? OWNER_USER_ID)
++		const accountKey = resolvedUserId ?? `unknown:${typedName!.toLowerCase()}`
++		const scope = client.remote ? 'remote' : 'local'
++		const attempt = this.loginThrottle.begin([
++			{key: `account:${scope}:${accountKey}`, policy: ACCOUNT_POLICY},
++			{key: `ip:${client.ip}`, policy: IP_POLICY},
++		])
++		if (!attempt.allowed) {
++			this.logger.error(`Login throttled for ${client.remote ? 'remote' : 'local'} client ${client.ip}`)
++			return {valid: false, reason: 'rate-limited', retryAfterSeconds: Math.ceil(attempt.retryAfterMs / 1000)}
++		}
++
++		let result: AccountLoginValidation
++		if (resolvedUserId === undefined) {
++			await bcrypt.compare(password, DUMMY_PASSWORD_HASH)
++			result = {valid: false, reason: 'incorrect-password'}
++		} else {
++			try {
++				result = await this.validateAccountLogin(resolvedUserId, password, totpToken)
++			} catch (error) {
++				attempt.cancel()
++				throw error
++			}
++		}
++
++		if (result.valid) attempt.succeed()
++		else if (result.reason === 'missing-totp') attempt.cancel()
++		return {...result, userId: resolvedUserId ?? accountKey}
++	}
++
+ 	// ── Account scoped settings ─────────────────────────────────────────────
+ 	// These operate on either the owner (user id '0', stored in the top level
+ 	// 'user' object) or a member (stored in the 'members' array), so endpoints
 diff --git a/packages/umbreld/source/modules/utilities/safe-redirect-path.ts b/packages/umbreld/source/modules/utilities/safe-redirect-path.ts
 new file mode 100644
 index 0000000..be7eb38

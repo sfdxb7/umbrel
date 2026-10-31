@@ -1,8 +1,8 @@
 diff --git a/packages/ui/public/locales/en.json b/packages/ui/public/locales/en.json
-index 41c8713..733e891 100644
+index 41c8713..db18c35 100644
 --- a/packages/ui/public/locales/en.json
 +++ b/packages/ui/public/locales/en.json
-@@ -2796,5 +2796,37 @@
+@@ -2796,5 +2796,38 @@
    "onboarding.raid.return-to-start": "Return to start",
    "onboarding.raid.return-to-start-warning": "Your Umbrel may still be working. Returning will check its current status, but won’t cancel or repeat the operation. Keep it powered on and review its storage before starting setup or restore again.",
    "onboarding.raid.wait-warning": "Keep your Umbrel powered on while you check its status.",
@@ -20,6 +20,7 @@ index 41c8713..733e891 100644
 +  "remote-domain.base-domain-suggested": "Suggested from the address you're using: {{domain}}. Check it, then turn the mode on and save.",
 +  "remote-domain.advanced": "Advanced",
 +  "remote-domain.advanced-description": "The defaults are fine for most setups. Only change these if your reverse proxy or DNS uses different names.",
++  "remote-domain.advanced-login-note": "If an app doesn't work on the remote domain, turn on Umbrel's login in that app's settings. Apps with the login off are blocked remotely unless you allow them under Apps on the remote domain.",
 +  "remote-domain.origin-rewrite-disabled": "Send the original Host and Origin headers to these apps",
 +  "remote-domain.origin-rewrite-disabled-help": "By default, requests on an app's remote host reach the app with the Host, Origin and Referer it sees on your local network (for example http://umbrel.local:3015), so apps that check them keep working. List app ids here, separated by commas, to turn that off for them, for example for apps that compare Origin with X-Forwarded-Host.",
 +  "remote-domain.dashboard-subdomain": "Dashboard subdomain",
@@ -347,10 +348,10 @@ index 210e73e..9ea1b0c 100644
  		) : activePanel === 'network' ? (
 diff --git a/packages/ui/src/routes/settings/remote-domain.tsx b/packages/ui/src/routes/settings/remote-domain.tsx
 new file mode 100644
-index 0000000..a246704
+index 0000000..d6a933b
 --- /dev/null
 +++ b/packages/ui/src/routes/settings/remote-domain.tsx
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,280 @@
 +import React from 'react'
 +import {useTranslation} from 'react-i18next'
 +import {TbAlertTriangle} from 'react-icons/tb'
@@ -518,6 +519,7 @@ index 0000000..a246704
 +						<summary className='cursor-pointer text-14 font-medium'>{t('remote-domain.advanced')}</summary>
 +						<div className='mt-3 flex flex-col gap-y-3'>
 +							<p className='text-12 leading-tight text-white/45'>{t('remote-domain.advanced-description')}</p>
++							<p className='text-12 leading-tight text-white/45'>{t('remote-domain.advanced-login-note')}</p>
 +							<Labeled label={t('remote-domain.dashboard-subdomain')}>
 +								<Input
 +									sizeVariant='short-square'

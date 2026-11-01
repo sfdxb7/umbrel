@@ -1,8 +1,8 @@
 diff --git a/packages/ui/public/locales/en.json b/packages/ui/public/locales/en.json
-index db18c35..51ce66f 100644
+index db18c35..8e1ddde 100644
 --- a/packages/ui/public/locales/en.json
 +++ b/packages/ui/public/locales/en.json
-@@ -2829,5 +2829,31 @@
+@@ -2829,5 +2829,32 @@
    "remote-domain.client-ip-header": "Client IP header",
    "remote-domain.client-ip-header-help": "Optional. A header your trusted proxy sets to the visitor's IP, such as X-Real-IP. Leave empty to use X-Forwarded-For.",
    "remote-domain.public-paths": "Allow public paths on the remote domain",
@@ -28,6 +28,7 @@ index db18c35..51ce66f 100644
 +  "remote-domain.remote-access-kind-declared": "declared rewrite",
 +  "remote-domain.remote-access-kind-kept": "kept as is",
 +  "remote-domain.remote-access-kind-main-port": "main app address, unchanged",
++  "remote-domain.remote-access-kind-base-url": "the app's own address, changed to its remote address",
 +  "remote-domain.remote-access-kind-trusted-origins": "trusted origins, remote addresses added",
 +  "remote-domain.remote-access-kind-allowed-hosts": "allowed hosts, remote hosts added",
 +  "remote-domain.remote-access-kind-server-side": "used by the server only, unchanged",
@@ -212,10 +213,10 @@ index d6a933b..1476386 100644
  const cardClass = tw`flex items-start gap-x-2 rounded-12 bg-white/6 p-4`
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts b/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts
 new file mode 100644
-index 0000000..598480c
+index 0000000..51754d2
 --- /dev/null
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,349 @@
 +import http from 'node:http'
 +import net from 'node:net'
 +
@@ -466,9 +467,57 @@ index 0000000..598480c
 +		expect(await second.text()).toContain(`action="https://${GW}/umbrel_/api/v1/auth/handoff"`)
 +
 +		const last = await request(GW, '/umbrel_/api/v1/auth/handoff', form({handoff: 'next-handoff', r: '/chat', chain: '1'}))
-+		expect(last.status).toBe(302)
-+		expect(last.headers.get('location')).toBe(`https://${MAIN}/chat`)
++		expect(last.status).toBe(200)
++		expect(last.headers.get('location')).toBeNull()
++		expect(await last.text()).toContain(`location.replace(${JSON.stringify(`https://${MAIN}/chat`)})`)
 +		expect(umbreld.auth.consumeAppHandoff).toHaveBeenCalledTimes(3)
++	})
++
++	// Walks the chain the way a browser does. Chrome checks a redirect that
++	// follows a form POST against the submitting page's CSP form-action, so
++	// every hop must stay within it until the browser lands back on the app.
++	test('every hop of the login chain is allowed by the previous page CSP', async () => {
++		const {request} = await start()
++		const formAction = (csp: string | null) => /form-action ([^;]+)/.exec(csp ?? '')?.[1].trim().split(/\s+/) ?? []
++		let response = await request(MAIN, '/umbrel_/api/v1/auth/handoff', {
++			method: 'POST',
++			body: new URLSearchParams({handoff: 'login-handoff', r: '/chat'}).toString(),
++			headers: {'content-type': 'application/x-www-form-urlencoded'},
++		})
++		let allowed: string[] = ['*']
++		let landed: string | undefined
++		for (let hop = 0; hop < 10 && !landed; hop++) {
++			if (response.status >= 300 && response.status < 400) {
++				const location = new URL(response.headers.get('location')!)
++				expect(allowed, `redirect to ${location.origin}`).toSatisfy(
++					(list: string[]) => list.includes('*') || list.includes(location.origin),
++				)
++				landed = location.href
++				break
++			}
++			expect(response.status).toBe(200)
++			const csp = response.headers.get('content-security-policy')
++			const page = await response.text()
++			const navigate = /location\.replace\(("[^"]*")\)/.exec(page)
++			if (navigate) {
++				expect(formAction(csp)).toEqual(["'none'"])
++				landed = JSON.parse(navigate[1])
++				break
++			}
++			const action = /action="([^"]+)"/.exec(page)![1]
++			allowed = formAction(csp)
++			expect(allowed).toContain(new URL(action).origin)
++			const fields = Object.fromEntries(
++				[...page.matchAll(/name="([^"]+)" value="([^"]*)"/g)].map(([, name, value]) => [name, value]),
++			)
++			const url = new URL(action)
++			response = await request(url.host, url.pathname, {
++				method: 'POST',
++				body: new URLSearchParams(fields).toString(),
++				headers: {'content-type': 'application/x-www-form-urlencoded'},
++			})
++		}
++		expect(landed).toBe(`https://${MAIN}/chat`)
 +	})
 +
 +	test('a main-host session without the current marker runs the chain once', async () => {
@@ -518,10 +567,10 @@ index 0000000..598480c
 +	})
 +})
 diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway.ts b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-index 28f3908..453120f 100644
+index 28f3908..b20ff94 100644
 --- a/packages/umbreld/source/modules/app-gateway/app-gateway.ts
 +++ b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
-@@ -13,9 +13,20 @@ import type Umbreld from '../../index.js'
+@@ -13,9 +13,21 @@ import type Umbreld from '../../index.js'
  import {
  	appGatewayTokenFromCookieHeader,
  	appGatewayTokenFromRequest,
@@ -533,6 +582,7 @@ index 28f3908..453120f 100644
 +	applyCorsHeaders,
 +	corsOrigin,
 +	handoffFormPage,
++	returnPage,
 +	isTopLevelNavigation,
 +	preflightHeaders,
 +	remoteHostsMarker,
@@ -542,7 +592,7 @@ index 28f3908..453120f 100644
  import {SESSION_DURATION} from '../auth/auth.js'
  import {appGatewayErrorPage} from './error-page.js'
  import safeRedirectPath from '../utilities/safe-redirect-path.js'
-@@ -55,6 +66,9 @@ type AppGatewayOptions = {
+@@ -55,6 +67,9 @@ type AppGatewayOptions = {
  	// The origin a LAN browser uses for this app, e.g. http://umbrel.local:3015.
  	// Remote requests present this Host/Origin/Referer to the app.
  	getLanOrigin?: () => string | undefined
@@ -552,7 +602,7 @@ index 28f3908..453120f 100644
  }
  
  function environmentRecord(environment: unknown) {
-@@ -183,7 +197,9 @@ export default class AppGateway {
+@@ -183,7 +198,9 @@ export default class AppGateway {
  	#onUpstreamUnavailable?: () => void
  	#getRemoteDomain?: () => RemoteDomain | undefined
  	#getLanOrigin?: () => string | undefined
@@ -562,7 +612,7 @@ index 28f3908..453120f 100644
  	server: http.Server
  
  	constructor(umbreld: Umbreld, config: AppGatewayConfig, options: AppGatewayOptions = {}) {
-@@ -192,6 +208,7 @@ export default class AppGateway {
+@@ -192,6 +209,7 @@ export default class AppGateway {
  		this.#onUpstreamUnavailable = options.onUpstreamUnavailable
  		this.#getRemoteDomain = options.getRemoteDomain
  		this.#getLanOrigin = options.getLanOrigin
@@ -570,7 +620,7 @@ index 28f3908..453120f 100644
  		this.#proxy = this.createProxy()
  
  		const app = express()
-@@ -346,8 +363,12 @@ export default class AppGateway {
+@@ -346,8 +364,12 @@ export default class AppGateway {
  		const local = {...this.#config, lanOrigin: this.#getLanOrigin?.()}
  		const {location, refresh} = proxyResponse.headers
  		if (typeof location === 'string') {
@@ -584,7 +634,7 @@ index 28f3908..453120f 100644
  		if (typeof refresh === 'string') {
  			proxyResponse.headers.refresh = rewriteLocalRefresh(refresh, local, rewrite.remoteOrigin)
  		}
-@@ -387,12 +408,190 @@ export default class AppGateway {
+@@ -387,12 +409,191 @@ export default class AppGateway {
  		if (typeof request.body?.handoff !== 'string') return response.status(400).send('Invalid handoff')
  		const handoff = await this.#umbreld.auth.consumeAppHandoff(this.#config.appId, request.body.handoff)
  		setAppGatewayCookie(response, request, handoff.appGatewayToken, new Date(Date.now() + SESSION_DURATION))
@@ -606,7 +656,8 @@ index 28f3908..453120f 100644
 +			if (index >= 0 && request.body.chain === '1') {
 +				const next = chain[index + 1]
 +				if (next) return this.sendHandoff(response, next.origin, handoff.appGatewayToken, redirect)
-+				return response.redirect(`https://${mainHost}${redirect}`)
++				const page = returnPage(`https://${mainHost}${redirect}`)
++				return response.status(200).set(page.headers).send(page.body)
 +			}
 +		}
 +		response.redirect(redirect)
@@ -777,7 +828,7 @@ index 28f3908..453120f 100644
  		} catch {
  			const remoteRedirect = remoteLoginRedirect(
  				this.#getRemoteDomain?.(),
-@@ -422,6 +621,7 @@ export default class AppGateway {
+@@ -422,6 +623,7 @@ export default class AppGateway {
  			response.redirect(`${request.protocol}://${host}/app-auth?${searchParams}`)
  			return
  		}
@@ -785,7 +836,7 @@ index 28f3908..453120f 100644
  		this.#proxy(request, response, (error) => {
  			if (error) this.sendUpstreamError(response, error)
  		})
-@@ -429,6 +629,21 @@ export default class AppGateway {
+@@ -429,6 +631,21 @@ export default class AppGateway {
  
  	private async handleUpgrade(request: http.IncomingMessage, socket: net.Socket, head: Buffer) {
  		const appAccessRevision = this.#umbreld.auth.appAccessRevision
@@ -809,10 +860,10 @@ index 28f3908..453120f 100644
  		// session or app-share revocation cannot race a late app WebSocket into
 diff --git a/packages/umbreld/source/modules/app-gateway/remote-ports.ts b/packages/umbreld/source/modules/app-gateway/remote-ports.ts
 new file mode 100644
-index 0000000..8d13cc3
+index 0000000..de95171
 --- /dev/null
 +++ b/packages/umbreld/source/modules/app-gateway/remote-ports.ts
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,142 @@
 +import crypto from 'node:crypto'
 +import type http from 'node:http'
 +
@@ -850,6 +901,31 @@ index 0000000..8d13cc3
 +
 +// A page that POSTs a single-use handoff to the next host. The handoff never
 +// goes in a URL. CSP allows only this script and only this form target.
++// The last hop of the handoff chain. A redirect would be checked against the
++// previous page's CSP form-action (Chrome applies form-action to redirects
++// after a form POST), which only allows that hop's own target. A 200 page that
++// navigates with script is not a form submission, so it is not limited by
++// form-action. The caller passes only the app's own main remote origin and a
++// path checked by safeRedirect, so this is never an open redirect.
++export function returnPage(url: string) {
++	const nonce = crypto.randomBytes(16).toString('base64')
++	const target = JSON.stringify(url).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
++	const body =
++		`<!doctype html><html><head><meta charset="utf-8"><title>Signing in…</title></head><body>` +
++		`<noscript><a href="${escapeHtml(url)}">Continue</a></noscript>` +
++		`<script nonce="${nonce}">location.replace(${target})</script></body></html>`
++	return {
++		body,
++		headers: {
++			'cache-control': 'no-store',
++			'content-type': 'text/html; charset=utf-8',
++			'referrer-policy': 'no-referrer',
++			'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'`,
++			'x-content-type-options': 'nosniff',
++		},
++	}
++}
++
 +export function handoffFormPage(action: string, fields: Record<string, string>) {
 +	const nonce = crypto.randomBytes(16).toString('base64')
 +	const inputs = Object.entries(fields)
@@ -1622,18 +1698,28 @@ index 0000000..699d729
 +port: 27829
 +path: ''
 diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
-index 3d08a1d..381c930 100644
+index 3d08a1d..ae36210 100644
 --- a/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
 +++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
-@@ -12,6 +12,7 @@ type Internals = {
+@@ -4,7 +4,7 @@ import {afterEach, describe, expect, test, vi} from 'vitest'
+ const {execaDollar} = vi.hoisted(() => ({execaDollar: vi.fn(() => vi.fn(async () => ({exitCode: 0, stdout: ''})))}))
+ vi.mock('execa', () => ({$: execaDollar}))
+ 
+-import LanIngress from './lan-ingress.js'
++import LanIngress, {REMOTE_REJECT_HEADER} from './lan-ingress.js'
+ import type {RemoteDomainSettings} from './remote-domain.js'
+ 
+ type Internals = {
+@@ -12,6 +12,8 @@ type Internals = {
  	remoteAppAuth(appId: string): boolean | undefined
  	updateRemoteAppHosts(): void
  	remoteDispatchFor(host: string, protocol: 'https'): unknown
 +	setRemotePortTargets(targets: Map<string, unknown[]>): void
++	handleRemoteRequest(request: unknown, response: unknown, protocol: 'https', upstreamPort: number): boolean
  }
  
  // Remote routing has to follow app installs, updates, restarts and uninstalls
-@@ -124,4 +125,62 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
+@@ -124,4 +126,83 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
  		})
  		expect(emitted).toEqual(['lan-ingress:remote-routes:change'])
  	})
@@ -1695,9 +1781,30 @@ index 3d08a1d..381c930 100644
 +		})
 +		expect(ingress.remotePortRoutes('nextcloud')).toEqual([])
 +	})
++	// The e2e harness needs to tell "this host is not routed" from "the app
++	// answered 404 on this path".
++	test("Umbrel's own 404 for an unknown remote host carries a marker", async () => {
++		const {ingress, internals} = createIngress(enabled)
++		await start(ingress)
++		internals.updateRemoteAppHosts()
++		const written: {status?: number; headers?: Record<string, string>} = {}
++		const response = {
++			writeHead: (status: number, headers: Record<string, string>) => Object.assign(written, {status, headers}),
++			end: vi.fn(),
++		}
++		const handled = internals.handleRemoteRequest(
++			{headers: {host: 'unknown-umbrel.example.com'}},
++			response,
++			'https',
++			80,
++		)
++		expect(handled).toBe(true)
++		expect(written.status).toBe(404)
++		expect(written.headers?.[REMOTE_REJECT_HEADER]).toBe('rejected')
++	})
  })
 diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
-index 38fd88e..9856383 100644
+index 38fd88e..b0b3f85 100644
 --- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
 +++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
 @@ -19,7 +19,10 @@ import {forwardTcp} from './forward-tcp.js'
@@ -1739,15 +1846,23 @@ index 38fd88e..9856383 100644
  export type RemoteAppStatus = {
  	appId: string
  	origin: string
-@@ -94,6 +118,7 @@ export type RemoteAppStatus = {
+@@ -94,8 +118,15 @@ export type RemoteAppStatus = {
  	// remote domain they need the owner's per-app opt-in.
  	publicPaths: string[]
  	publicPathsAllowed: boolean
 +	remoteAccess: RemoteAccessStatus
  }
  
++// Marks responses Umbrel writes itself on the remote domain (unknown host,
++// app starting, HTTP refused, app blocked), so a client or test can tell
++// Umbrel's own 404 apart from a 404 the app sent.
++export const REMOTE_REJECT_HEADER = 'x-umbrel-remote'
++export const REMOTE_REJECT_VALUE = 'rejected'
++
  // Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
-@@ -226,6 +251,11 @@ export default class LanIngress {
+ // - Hosts outside the remote domain (IP, LAN, mDNS, Tailscale) and the dashboard
+ //   host keep today's behaviour.
+@@ -226,6 +257,11 @@ export default class LanIngress {
  	// umbrel.yaml (FileStore re-reads the file on every get).
  	#remoteDomain?: RemoteDomain
  	#remoteAppHosts = new Map<string, string>()
@@ -1759,7 +1874,7 @@ index 38fd88e..9856383 100644
  	#remoteAuthProxy?: RequestHandler
  	#remoteRoutesSignature = ''
  	// The mDNS name apps are told about (DEVICE_DOMAIN_NAME), used as the LAN
-@@ -691,9 +721,11 @@ export default class LanIngress {
+@@ -691,9 +727,11 @@ export default class LanIngress {
  							this.logger.verbose(`Skipping LAN ingress route for ${appId}; app gateway target is unavailable`)
  							return {reservedPorts, route: null}
  						}
@@ -1771,7 +1886,7 @@ index 38fd88e..9856383 100644
  						}
  					}
  
-@@ -716,6 +748,16 @@ export default class LanIngress {
+@@ -716,6 +754,16 @@ export default class LanIngress {
  				}
  			}),
  		)
@@ -1788,7 +1903,7 @@ index 38fd88e..9856383 100644
  		for (const [appId, wait] of this.#appGatewayWaits) {
  			if (gatewayIds.has(appId)) continue
  			wait.controller.abort()
-@@ -744,6 +786,48 @@ export default class LanIngress {
+@@ -744,6 +792,48 @@ export default class LanIngress {
  		return [...mappingsByHiddenPort.values()]
  	}
  
@@ -1837,7 +1952,7 @@ index 38fd88e..9856383 100644
  	private canRouteAppDirectly(compose: ComposeFile | null, publicPort: number, publishedPorts: number[]) {
  		if (!compose?.services) return false
  		// Some apps publish their UI port directly without app_proxy.
-@@ -974,14 +1058,105 @@ export default class LanIngress {
+@@ -974,14 +1064,105 @@ export default class LanIngress {
  	// Only apps behind the app gateway get a remote host. Directly routed and
  	// non-HTTP apps stay on LAN/Tailscale ports.
  	private updateRemoteAppHosts() {
@@ -1945,7 +2060,7 @@ index 38fd88e..9856383 100644
  	// apps.list carries each app's remote URL, and gateway routes appear only
  	// after the app's container accepts connections, which is after the app's
  	// state already changed. Tell clients when the routed set really changes.
-@@ -989,6 +1164,7 @@ export default class LanIngress {
+@@ -989,6 +1170,7 @@ export default class LanIngress {
  		const signature = JSON.stringify({
  			remote: this.#remoteDomain ?? null,
  			apps: this.remoteAppStatus(),
@@ -1953,7 +2068,7 @@ index 38fd88e..9856383 100644
  		})
  		if (signature === this.#remoteRoutesSignature) return
  		const isFirst = this.#remoteRoutesSignature === ''
-@@ -1037,6 +1213,7 @@ export default class LanIngress {
+@@ -1037,6 +1219,7 @@ export default class LanIngress {
  					reachable: authEnabled || allowed,
  					publicPaths,
  					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
@@ -1961,7 +2076,7 @@ index 38fd88e..9856383 100644
  				}
  			})
  			.sort((a, b) => a.appId.localeCompare(b.appId))
-@@ -1062,7 +1239,7 @@ export default class LanIngress {
+@@ -1062,7 +1245,7 @@ export default class LanIngress {
  	private remoteDispatchFor(host: string | undefined, protocol: 'http' | 'https') {
  		return remoteDispatch({
  			remote: this.#remoteDomain,
@@ -1970,7 +2085,40 @@ index 38fd88e..9856383 100644
  			appAuth: (id) => this.remoteAppAuth(id),
  			host,
  			protocol,
-@@ -1227,6 +1404,7 @@ export default class LanIngress {
+@@ -1105,6 +1288,7 @@ export default class LanIngress {
+ 				'content-type': 'text/plain; charset=utf-8',
+ 				'cache-control': 'no-store',
+ 				'x-content-type-options': 'nosniff',
++				[REMOTE_REJECT_HEADER]: REMOTE_REJECT_VALUE,
+ 				// A starting app retries on its own once its route is ready.
+ 				...(dispatch.status === 503 ? {'retry-after': '5', refresh: '5'} : {}),
+ 			})
+@@ -1113,7 +1297,12 @@ export default class LanIngress {
+ 		}
+ 		const handler = this.remoteHandler(dispatch)
+ 		if (!handler) {
+-			response.writeHead(404, {'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store'})
++			response.writeHead(404, {
++				'content-type': 'text/plain; charset=utf-8',
++				'cache-control': 'no-store',
++				'x-content-type-options': 'nosniff',
++				[REMOTE_REJECT_HEADER]: REMOTE_REJECT_VALUE,
++			})
+ 			response.end('Not Found\n')
+ 			return true
+ 		}
+@@ -1135,7 +1324,9 @@ export default class LanIngress {
+ 		const handler = dispatch.type === 'reject' ? undefined : this.remoteHandler(dispatch)
+ 		if (!handler?.upgrade) {
+ 			const status = dispatch.type === 'reject' ? dispatch.status : 404
+-			socket.write(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\n\r\n`)
++			socket.write(
++				`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\n${REMOTE_REJECT_HEADER}: ${REMOTE_REJECT_VALUE}\r\nConnection: close\r\n\r\n`,
++			)
+ 			socket.destroy()
+ 			return true
+ 		}
+@@ -1227,6 +1418,7 @@ export default class LanIngress {
  					onUpstreamUnavailable: () => void this.requestAppTargetRecovery(route.gateway!),
  					getRemoteDomain: () => this.#remoteDomain,
  					getLanOrigin: () => lanAppOrigin(this.#lanHostname, route.publicPort),
@@ -2109,10 +2257,10 @@ index 0000000..9a3277f
 +}
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-access.ts b/packages/umbreld/source/modules/lan-ingress/remote-access.ts
 new file mode 100644
-index 0000000..4e71cf4
+index 0000000..e8997d4
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-access.ts
-@@ -0,0 +1,736 @@
+@@ -0,0 +1,798 @@
 +import net from 'node:net'
 +
 +import {appPortRemoteHost, appRemoteHost, type RemoteDomain} from './remote-domain.js'
@@ -2161,6 +2309,10 @@ index 0000000..4e71cf4
 +	| 'kept'
 +	// Device URL on the main port: the gateway already maps it (Host/Location).
 +	| 'main-port'
++	// The app's own base URL on the main port (APP_URL, NEXTAUTH_URL, ...), in a
++	// service that also has a trusted-origin list. Rewritten to the main remote
++	// host; the original LAN origin is kept in that list.
++	| 'base-url'
 +	// A trusted-origins / allowed-hosts list: public origins are appended.
 +	| 'trusted-origins'
 +	| 'allowed-hosts'
@@ -2222,6 +2374,9 @@ index 0000000..4e71cf4
 +const TRUSTED_ORIGINS_NAME =
 +	/(?:^|_)(?:(?:TRUSTED|ALLOWED|ADDITIONAL_TRUSTED|CSRF_TRUSTED)_ORIGINS?|CORS_(?:ALLOWED_)?ORIGINS?|ALLOW_ORIGINS?|ORIGINS)$/
 +const ALLOWED_HOSTS_NAME = /(?:^|_)(?:ALLOWED_HOSTS|TRUSTED_HOSTS)$/
++// Names an app uses for its own address: APP_URL, NEXTAUTH_URL, PUBLIC_URL,
++// BASE_URL, SITE_URL, ROOT_URL, APP_ORIGIN, ...
++const BASE_URL_NAME = /(?:^|_)(?:URL|URI|ORIGIN)$/
 +const S3_NAME = /(?:^|_)(?:S3|MINIO|BUCKET|OBJECT_STORAGE|OBJECT_STORE)(?:_|$)/
 +const S3_IMAGE = /(?:^|\/)(?:minio|rustfs|seaweedfs|garage|localstack|s3)[^/]*(?::|$)/i
 +
@@ -2505,6 +2660,16 @@ index 0000000..4e71cf4
 +	return {declaration, errors}
 +}
 +
++// The whole value is one URL (with an optional path), not a list or a string
++// with other text in it.
++function isSingleUrl(value: string) {
++	const trimmed = value.trim()
++	URL_PATTERN.lastIndex = 0
++	const match = URL_PATTERN.exec(trimmed)
++	URL_PATTERN.lastIndex = 0
++	return !!match && match.index === 0 && !/[\s,;]/.test(trimmed)
++}
++
 +function matchesEntry(entry: {service?: string; name: string}, service: string, name: string) {
 +	return entry.name === name && (entry.service === undefined || entry.service === service)
 +}
@@ -2579,6 +2744,20 @@ index 0000000..4e71cf4
 +		browserPorts.set(port, entry)
 +	}
 +
++	// Services whose own config trusts more than one origin (a trusted-origin
++	// list, or *). Only there is a main-port base URL rewritten: the LAN origin
++	// stays trusted next to the remote one, so LAN logins keep passing the
++	// app's origin check.
++	const isTrustedList = (serviceName: string, name: string) =>
++		declaredOrigins
++			? declaredOrigins.some((entry) => matchesEntry(entry, serviceName, name))
++			: TRUSTED_ORIGINS_NAME.test(name)
++	const multiOriginServices = new Set(
++		allServices
++			.filter(([serviceName, service]) => [...serviceEnvironment(service).keys()].some((name) => isTrustedList(serviceName, name)))
++			.map(([serviceName]) => serviceName),
++	)
++
 +	for (const [serviceName, service] of allServices) {
 +		if (serviceName === 'app_proxy') continue
 +		if (service.env_file !== undefined) {
@@ -2588,10 +2767,7 @@ index 0000000..4e71cf4
 +		}
 +		for (const [name, value] of serviceEnvironment(service)) {
 +			const declared = declaredEnv.find((entry) => matchesEntry(entry, serviceName, name))
-+			const trusted = declaredOrigins
-+				? declaredOrigins.some((entry) => matchesEntry(entry, serviceName, name))
-+				: TRUSTED_ORIGINS_NAME.test(name)
-+			if (trusted) {
++			if (isTrustedList(serviceName, name)) {
 +				const wildcard = value.split(/[\s,]+/).includes('*')
 +				env.push({
 +					service: serviceName,
@@ -2645,10 +2821,22 @@ index 0000000..4e71cf4
 +					continue
 +				}
 +				if (url.port === mainPort) {
++					const baseUrl = BASE_URL_NAME.test(name) && !SERVER_SIDE_NAME.test(name) && isSingleUrl(value)
++					if (baseUrl && enabled && multiOriginServices.has(serviceName)) {
++						env.push({
++							...entry,
++							kind: 'base-url',
++							reason:
++								"The app's own address on the main port; rewritten to the main remote host. The service has a trusted-origin list, so the LAN origin stays trusted there",
++						})
++						continue
++					}
 +					env.push({
 +						...entry,
 +						kind: 'main-port',
-+						reason: 'Main port: the gateway already maps Host, Origin and redirects, so it is not rewritten',
++						reason: baseUrl
++							? "The app's own address on the main port, but the service has no trusted-origin list, so the app may accept only one origin; not rewritten. Declare it with port: main to rewrite it"
++							: 'Main port: the gateway already maps Host, Origin and redirects, so it is not rewritten',
 +					})
 +					continue
 +				}
@@ -2819,18 +3007,40 @@ index 0000000..4e71cf4
 +	const set = (service: string, name: string, value: string) => {
 +		;(overrides[service] ??= {})[name] = value
 +	}
++	// Base URLs moved to the main remote host keep their LAN origin trusted in
++	// the same service's trusted-origin lists (as written, ${VAR} included).
++	const lanOrigins = new Map<string, string[]>()
++	for (const entry of analysis.env) {
++		const movesMain = entry.kind === 'base-url' || (entry.kind === 'declared' && entry.port === mainPort)
++		if (!movesMain) continue
++		const raw = byService.get(entry.service) && serviceEnvironment(byService.get(entry.service)!).get(entry.name)
++		if (raw === undefined) continue
++		for (const url of findUrls(raw, context)) {
++			if (url.hostKind !== 'device' && url.hostKind !== 'unresolved') continue
++			const origin = raw.slice(url.index, url.index + url.length).replace(/\/\/[^@/]*@/, '//')
++			const list = lanOrigins.get(entry.service) ?? []
++			if (!list.includes(origin)) list.push(origin)
++			lanOrigins.set(entry.service, list)
++		}
++	}
 +	for (const entry of analysis.env) {
 +		const raw = byService.get(entry.service) && serviceEnvironment(byService.get(entry.service)!).get(entry.name)
 +		if (raw === undefined) continue
 +		if (entry.kind === 'trusted-origins' || entry.kind === 'allowed-hosts') {
 +			if (raw.split(/[\s,]+/).includes('*')) continue
-+			const next = appendToList(raw, entry.kind === 'trusted-origins' ? origins : hosts)
++			const additions =
++				entry.kind === 'trusted-origins' ? [...(lanOrigins.get(entry.service) ?? []), ...origins] : hosts
++			const next = appendToList(raw, additions)
 +			if (next !== raw) set(entry.service, entry.name, next)
 +			continue
 +		}
-+		if (entry.kind !== 'rewrite' && entry.kind !== 'declared') continue
++		if (entry.kind !== 'rewrite' && entry.kind !== 'declared' && entry.kind !== 'base-url') continue
 +		const targetHost =
-+			entry.kind === 'declared' && entry.port === mainPort ? mainHost : entry.port ? routed.get(entry.port) : undefined
++			entry.kind === 'base-url' || (entry.kind === 'declared' && entry.port === mainPort)
++				? mainHost
++				: entry.port
++					? routed.get(entry.port)
++					: undefined
 +		if (!targetHost) continue
 +		let next = ''
 +		let last = 0
@@ -2851,10 +3061,10 @@ index 0000000..4e71cf4
 +}
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts
 new file mode 100644
-index 0000000..66ca707
+index 0000000..68a4382
 --- /dev/null
 +++ b/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,285 @@
 +import fs from 'node:fs'
 +import path from 'node:path'
 +import {fileURLToPath} from 'node:url'
@@ -2913,7 +3123,7 @@ index 0000000..66ca707
 +		])
 +		expect(analysis.ports.find((port) => port.port === 7460)?.role).toBe('lan-only')
 +		expect(kinds(analysis)).toMatchObject({
-+			'app.APP_URL': 'main-port',
++			'app.APP_URL': 'base-url',
 +			'app.AUTH_TRUSTED_ORIGINS': 'trusted-origins',
 +			'app.S3_ENDPOINT': 'rewrite',
 +			'app.AGENT_GATEWAY_URL': 'rewrite',
@@ -2925,6 +3135,7 @@ index 0000000..66ca707
 +		expect(analysis.warnings.some((warning) => warning.includes('env_file'))).toBe(true)
 +		expect(environment).toEqual({
 +			app: {
++				APP_URL: 'https://lobe-chat-umbrel.example.com',
 +				S3_ENDPOINT: 'https://lobe-chat-7458-umbrel.example.com',
 +				AGENT_GATEWAY_URL: 'https://lobe-chat-7459-umbrel.example.com',
 +				AUTH_TRUSTED_ORIGINS:
@@ -3006,6 +3217,13 @@ index 0000000..66ca707
 +		expect(environment.app.AGENT_GATEWAY_URL).toBe('https://lobe-chat-7459-umbrel.example.com')
 +	})
 +
++	test('rewrite: false keeps the app base URL on its LAN address', () => {
++		const {analysis, environment} = analyse('lobe-chat', {localOverride: {env: [{name: 'APP_URL', rewrite: false}]}})
++		expect(kinds(analysis)['app.APP_URL']).toBe('kept')
++		expect(environment.app.APP_URL).toBeUndefined()
++		expect(environment.app.S3_ENDPOINT).toBe('https://lobe-chat-7458-umbrel.example.com')
++	})
++
 +	test('a declared port that is not published needs service and containerPort', () => {
 +		const {analysis} = analyse('lobe-chat', {localOverride: {ports: [{port: 9999}]}})
 +		expect(analysis.declarationErrors.some((error) => error.includes('port 9999 is not published'))).toBe(true)
@@ -3076,6 +3294,60 @@ index 0000000..66ca707
 +			},
 +		}})
 +		expect(environment.web.PUBLIC_WS_URL).toBe('wss://demo-7002-umbrel.example.com/socket')
++	})
++	describe('the app base URL on the main port', () => {
++		const run = (environment: Record<string, string>) => {
++			const compose = {
++				services: {
++					app_proxy: {environment: {APP_HOST: 'demo_web_1', APP_PORT: 80}},
++					web: {environment},
++				},
++			}
++			const analysis = analyseRemoteAccess({appId: 'demo', manifest: {port: 7000}, compose, deviceHosts})
++			return {analysis, environment: remoteAccessEnvironment({remote, appId: 'demo', analysis, compose, deviceHosts})}
++		}
++
++		test('is rewritten when the service trusts a list of origins, and the LAN origin stays trusted', () => {
++			const {analysis, environment} = run({
++				NEXTAUTH_URL: 'http://${DEVICE_DOMAIN_NAME}:7000/api/auth',
++				PUBLIC_URL: 'http://umbrel.local:7000',
++				CSRF_TRUSTED_ORIGINS: 'https://example.org',
++			})
++			expect(kinds(analysis)).toMatchObject({'web.NEXTAUTH_URL': 'base-url', 'web.PUBLIC_URL': 'base-url'})
++			expect(environment.web).toEqual({
++				NEXTAUTH_URL: 'https://demo-umbrel.example.com/api/auth',
++				PUBLIC_URL: 'https://demo-umbrel.example.com',
++				CSRF_TRUSTED_ORIGINS:
++					'https://example.org,http://${DEVICE_DOMAIN_NAME}:7000,http://umbrel.local:7000,https://demo-umbrel.example.com',
++			})
++		})
++
++		test('is rewritten next to a wildcard list, which stays as it is', () => {
++			const {environment} = run({APP_URL: 'http://umbrel.local:7000', CORS_ORIGINS: '*'})
++			expect(environment.web).toEqual({APP_URL: 'https://demo-umbrel.example.com'})
++		})
++
++		test('is kept when the app shows no trusted-origin list (it may accept one origin only)', () => {
++			const {analysis, environment} = run({APP_URL: 'http://umbrel.local:7000', BASE_URL: 'http://umbrel.local:7000'})
++			expect(kinds(analysis)).toMatchObject({'web.APP_URL': 'main-port', 'web.BASE_URL': 'main-port'})
++			expect(analysis.env.find((entry) => entry.name === 'APP_URL')?.reason).toContain('port: main')
++			expect(environment).toEqual({})
++		})
++
++		test('server-side names, lists and other names stay untouched', () => {
++			const {analysis, environment} = run({
++				INTERNAL_APP_URL: 'http://umbrel.local:7000',
++				CALLBACK_URLS: 'http://umbrel.local:7000/a,http://umbrel.local:7000/b',
++				WELCOME_TEXT: 'Open http://umbrel.local:7000',
++				TRUSTED_ORIGINS: 'http://umbrel.local:7000',
++			})
++			expect(kinds(analysis)).toMatchObject({
++				'web.INTERNAL_APP_URL': 'main-port',
++				'web.CALLBACK_URLS': 'main-port',
++				'web.WELCOME_TEXT': 'main-port',
++			})
++			expect(Object.keys(environment.web)).toEqual(['TRUSTED_ORIGINS'])
++		})
 +	})
 +})
 diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts

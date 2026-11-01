@@ -30,7 +30,7 @@ The settings are stored in `umbrel.yaml` under `settings.remoteDomain`.
   - the dashboard host serves the dashboard;
   - the auth host serves the app login page;
   - `<template>.<base domain>` serves that app through its app gateway.
-- Any **other host under the base domain gets 404**. Hosts outside the base domain (IPs, `umbrel.local`, Tailscale names) go to the dashboard exactly as before.
+- Any **other host under the base domain gets 404**. Every response umbreld writes itself on the remote domain (unknown host, app starting, HTTP refused, app blocked) carries `x-umbrel-remote: rejected`, so a `404` without it came from the app. Hosts outside the base domain (IPs, `umbrel.local`, Tailscale names) go to the dashboard exactly as before.
 - Auth and app hosts are only served over HTTPS (port 443). On port 80 they return `421`. This keeps the secure `__Host-` session cookies working.
 - Login redirects, the post-login handoff URL and the login page's CSP `form-action` are built from the **configured domain** as exact `https://` origins. They are never taken from the request's `Host` header.
 - Redirect paths are sanitised to same-origin paths. Schemes, `//host` and backslash tricks fall back to `/`.
@@ -246,7 +246,8 @@ A URL in an env value is classified as:
 | Kind | Rule | Effect |
 | --- | --- | --- |
 | `internal` | container, service, loopback or `host.docker.internal` host | never changed |
-| `main-port` | device host on the main port | not changed: the gateway already maps Host, Origin and redirects |
+| `base-url` | the whole value is one device URL on the main port, the name ends in `_URL`, `_URI` or `_ORIGIN` (`APP_URL`, `NEXTAUTH_URL`, `PUBLIC_URL`, `BASE_URL`, ...) and is not server-side, **and** the same service has a trusted-origin list | rewritten to `https://<app>-umbrel.<domain>` (path kept); the original LAN origin is added to that list so LAN logins still pass |
+| `main-port` | any other device URL on the main port, including a base URL in a service without a trusted-origin list | not changed: the gateway already maps Host, Origin and redirects |
 | `rewrite` | device host on another port the app publishes | the port becomes a browser port; the value is rewritten |
 | `server-side` | as above, but the name looks server-side (`INTERNAL`, `BACKEND`, `DB`, `REDIS`, ...) | not changed, warning |
 | `other-port` | device host on a port the app does not publish | not changed |
@@ -260,7 +261,7 @@ Services that load an `env_file` get a warning: those files are not read.
 
 Each browser port `P` gets `https://<app>-<P>-umbrel.<domain>` (the app template with `-<P>` after the app ID). The gateway proxies it to the service's container address and container port. It needs the same Umbrel login as the app. Other published ports stay LAN only. A port host that collides with another app's host is not routed.
 
-Login uses one host-only `__Host-` session cookie per host. After login on the main host the handoff is chained to every port host with single-use POST handoffs (CSP `form-action` pinned to the next host), then back to the app. A `__Host-UMBREL_REMOTE_HOSTS` marker cookie records which hosts were covered. When the set changes, the next page load runs the chain again. A request to a port host without a session gets a redirect to login (navigation) or `401` (fetch, XHR). Trade-off: every host of an app carries the same session token, so a compromised port service could read the cookie the app's main host also uses. The cookies stay host-only and the Umbrel cookies are stripped before requests reach the app.
+Login uses one host-only `__Host-` session cookie per host. After login on the main host the handoff is chained to every port host with single-use POST handoffs (CSP `form-action` pinned to the next host). The last port host answers with a `200` page that navigates back to the app's main host (a fixed `https://<app>-umbrel.<domain>` plus a checked local path). It is not a redirect: Chrome checks a redirect after a form POST against the previous page's `form-action`, which only allows that hop. A `__Host-UMBREL_REMOTE_HOSTS` marker cookie records which hosts were covered. When the set changes, the next page load runs the chain again. A request to a port host without a session gets a redirect to login (navigation) or `401` (fetch, XHR). Trade-off: every host of an app carries the same session token, so a compromised port service could read the cookie the app's main host also uses. The cookies stay host-only and the Umbrel cookies are stripped before requests reach the app.
 
 CORS on port hosts: preflights and responses only allow the app's own remote origins (exact match, with credentials). A `*` from the upstream is replaced by the requesting own origin. WebSocket upgrades need a session and an own `Origin`.
 
@@ -271,9 +272,12 @@ CORS on port hosts: preflights and responses only allow the app's own remote ori
 The user-settings override (`docker-compose.umbrel-user-settings.yml` in the app directory, generated) gets:
 
 - `rewrite` values with the device host and port replaced by the port host over `https`/`wss`, keeping path, query and every other `${VAR}`;
-- trusted-origin and allowed-hosts lists with the remote origins or hosts appended.
+- `base-url` values pointed at the main remote host;
+- trusted-origin and allowed-hosts lists with the remote origins or hosts appended (and the LAN origin of a moved base URL, if missing).
 
-Values the user set in the app's settings always win. With the remote domain off, or the app switched off, nothing is written. The main-port URLs stay LAN URLs, so the main app still works on the LAN.
+Values the user set in the app's settings always win. With the remote domain off, or the app switched off, nothing is written.
+
+**Why base URLs move only next to a trusted-origin list.** An app uses its base URL to build sign-in callbacks and absolute links, so a LAN base URL sends remote browsers to `http://umbrel.local:<port>` (lobe-chat: `/signin?callbackUrl=http://umbrel.local:7455/`). Rewriting it is only safe when the app accepts more than one origin: the gateway presents remote requests with the LAN `Origin`, and LAN browsers send the LAN `Origin` too, so both must stay trusted. A trusted-origin list (or `*`) in the same service is the signal; the LAN origin is kept in it. An app with a single base URL and no list may compare `Origin` with that one value, so it is left on its LAN address. Declare `{name: APP_URL, port: main}` to move it anyway, or `{name: APP_URL, rewrite: false}` to keep a detected one.
 
 ### Declaring and overriding
 
@@ -299,7 +303,7 @@ remoteAccess:
 
 ### LAN
 
-LAN, IP and Tailscale access to the main port is unchanged. Rewritten extra-port values point at the remote domain, so a LAN browser that uses them needs the remote domain to work. If that is a problem for an app, switch remote access off for it.
+LAN, IP and Tailscale access to the main port still reaches the app. Rewritten extra-port values and a moved base URL point at the remote domain, so a LAN browser that follows them (for example a sign-in callback) ends up on the remote host, and needs the remote domain to work. An app that derives `Secure` cookies from an `https` base URL can refuse logins over plain-http LAN. If that is a problem for an app, keep its base URL with `rewrite: false`, or switch remote access off for it.
 
 ## Known limits
 
@@ -371,3 +375,11 @@ Tests added: gateway tests against an upstream that enforces the Murmur check (P
 Port hosts are one level below the base domain, so the `*.<domain>` wildcard certificate and DNS record already cover them.
 
 Tests added: the analyser against the app-store templates of seven apps with fake secrets (`remote-access.unit.test.ts`), port-host proxying, CORS and WebSockets (`app-gateway-remote-ports.unit.test.ts`), route lifecycle (`lan-ingress-remote-lifecycle.unit.test.ts`), login handoff to port hosts (`app-auth-remote.unit.test.ts`), the env overrides (`app-settings.unit.test.ts`) and the settings (`remote-domain.unit.test.ts`).
+
+## Revision 8 (fixes from the rev7 end-to-end run)
+
+1. **The login chain no longer stalls.** The last port host returned a `302` to the main host. Chrome checks that redirect against the previous page's CSP `form-action`, which only allowed the port host, so the browser stayed on "Signing in…". The last hop now returns a `200` page whose nonce script navigates to the main host (`form-action 'none'`, no-store, no-referrer). The target is built from the app's own main remote origin and a checked local path, so it is not an open redirect. A one-port chain had the same bug.
+2. **The app's own base URL is rewritten** (`base-url`, see "What it reads"), but only next to a trusted-origin list, which keeps the LAN origin. On the seven test apps only lobe-chat changes: `APP_URL` → `https://lobe-chat-umbrel.<domain>`. `originRewriteDisabledApps`, the per-app switch and `rewrite: false` still win.
+3. **Umbrel's own remote-domain responses are marked** with `x-umbrel-remote: rejected`, so tests can tell "host not routed" from an app's own `404`.
+
+Tests added: a walk of the whole login chain that checks every hop against the submitting page's `form-action` (fails on rev7), base-URL detection and the LAN-origin append (`remote-access.unit.test.ts`), and the `404` marker (`lan-ingress-remote-lifecycle.unit.test.ts`).

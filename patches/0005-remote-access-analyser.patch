@@ -1,0 +1,3940 @@
+diff --git a/packages/ui/public/locales/en.json b/packages/ui/public/locales/en.json
+index db18c35..8e1ddde 100644
+--- a/packages/ui/public/locales/en.json
++++ b/packages/ui/public/locales/en.json
+@@ -2829,5 +2829,32 @@
+   "remote-domain.client-ip-header": "Client IP header",
+   "remote-domain.client-ip-header-help": "Optional. A header your trusted proxy sets to the visitor's IP, such as X-Real-IP. Leave empty to use X-Forwarded-For.",
+   "remote-domain.public-paths": "Allow public paths on the remote domain",
+-  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself."
++  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself.",
++  "remote-domain.remote-access": "Extra ports",
++  "remote-domain.remote-access-help": "This app's web page also talks to the ports below. Each gets its own address on your domain, behind Umbrel's login unless marked otherwise.",
++  "remote-domain.remote-access-none": "No extra browser-facing ports were found.",
++  "remote-domain.remote-access-disabled": "Off: the extra ports get no address and the app's settings are not changed. Restart the app after switching.",
++  "remote-domain.remote-access-host": "Port {{port}}: {{origin}}",
++  "remote-domain.remote-access-auth-umbrel": "Umbrel login",
++  "remote-domain.remote-access-auth-app": "app's own login",
++  "remote-domain.remote-access-not-routed": "waiting for the container",
++  "remote-domain.remote-access-restart": "Saved. Restart {{apps}} to apply the changed address settings.",
++  "remote-domain.remote-access-details": "Details {{source}}",
++  "remote-domain.remote-access-source-heuristic": "(detected from the app's files)",
++  "remote-domain.remote-access-source-manifest": "(declared by the app)",
++  "remote-domain.remote-access-source-local-override": "(your local override)",
++  "remote-domain.remote-access-analysed": "Last applied when the app started: {{date}}",
++  "remote-domain.remote-access-not-analysed": "Not analysed yet. Restart the app to analyse it.",
++  "remote-domain.remote-access-applied": "changed",
++  "remote-domain.remote-access-kind-rewrite": "points to an extra port, rewritten to its address",
++  "remote-domain.remote-access-kind-declared": "declared rewrite",
++  "remote-domain.remote-access-kind-kept": "kept as is",
++  "remote-domain.remote-access-kind-main-port": "main app address, unchanged",
++  "remote-domain.remote-access-kind-base-url": "the app's own address, changed to its remote address",
++  "remote-domain.remote-access-kind-trusted-origins": "trusted origins, remote addresses added",
++  "remote-domain.remote-access-kind-allowed-hosts": "allowed hosts, remote hosts added",
++  "remote-domain.remote-access-kind-server-side": "used by the server only, unchanged",
++  "remote-domain.remote-access-kind-other-port": "a port not used by the browser, unchanged",
++  "remote-domain.remote-access-kind-internal": "internal address, unchanged",
++  "remote-domain.remote-access-kind-unresolved": "could not be resolved, unchanged"
+ }
+diff --git a/packages/ui/src/routes/settings/remote-domain.tsx b/packages/ui/src/routes/settings/remote-domain.tsx
+index d6a933b..1476386 100644
+--- a/packages/ui/src/routes/settings/remote-domain.tsx
++++ b/packages/ui/src/routes/settings/remote-domain.tsx
+@@ -21,6 +21,7 @@ type Draft = {
+ 	allowUnauthenticatedApps: string[]
+ 	originRewriteDisabledApps: string[]
+ 	allowPublicPathApps: string[]
++	remoteAccessDisabledApps: string[]
+ 	trustedProxies: string[]
+ 	clientIpHeader: string
+ }
+@@ -51,6 +52,7 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
+ 		allowUnauthenticatedApps: 'allowUnauthenticatedApps' in data ? data.allowUnauthenticatedApps : [],
+ 		originRewriteDisabledApps: 'originRewriteDisabledApps' in data ? data.originRewriteDisabledApps : [],
+ 		allowPublicPathApps: 'allowPublicPathApps' in data ? data.allowPublicPathApps : [],
++		remoteAccessDisabledApps: 'remoteAccessDisabledApps' in data ? data.remoteAccessDisabledApps : [],
+ 		trustedProxies: 'trustedProxies' in data ? data.trustedProxies : [],
+ 		clientIpHeader: 'clientIpHeader' in data ? data.clientIpHeader : '',
+ 	}
+@@ -74,10 +76,20 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
+ 
+ 	const save = async (next: Draft, {keepDraft = false} = {}) => {
+ 		try {
+-			await setMut.mutateAsync(next)
++			const result = await setMut.mutateAsync(next)
+ 			if (!keepDraft) setDraft(next)
+-			await Promise.all([utils.lanIngress.getRemoteDomain.invalidate(), utils.apps.list.invalidate()])
+-			toast.success(t('remote-domain.saved'), {area: 'settings'})
++			await Promise.all([
++				utils.lanIngress.getRemoteDomain.invalidate(),
++				utils.lanIngress.getRemoteAccess.invalidate(),
++				utils.apps.list.invalidate(),
++			])
++			if (result.restartRequired.length > 0) {
++				toast.success(t('remote-domain.remote-access-restart', {apps: result.restartRequired.join(', ')}), {
++					area: 'settings',
++				})
++			} else {
++				toast.success(t('remote-domain.saved'), {area: 'settings'})
++			}
+ 		} catch (error) {
+ 			const message = error instanceof Error ? error.message : t('unknown-error')
+ 			toast.error(t('remote-domain.save-error', {message}), {area: 'settings'})
+@@ -108,6 +120,16 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
+ 		update({allowPublicPathApps})
+ 	}
+ 
++	const toggleRemoteAccess = (appId: string, enabled: boolean) => {
++		if (!saved) return
++		const disabled = new Set(saved.remoteAccessDisabledApps)
++		if (enabled) disabled.delete(appId)
++		else disabled.add(appId)
++		const remoteAccessDisabledApps = [...disabled]
++		void save({...saved, remoteAccessDisabledApps}, {keepDraft: true})
++		update({remoteAccessDisabledApps})
++	}
++
+ 	// A remote domain puts the login page on the internet. Nudge the owner
+ 	// towards 2FA without blocking the setting.
+ 	const show2faWarning = !!draft?.enabled && twoFactorQ.data === false
+@@ -269,6 +291,17 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
+ 									/>
+ 								</div>
+ 							)}
++							{(app.remoteAccess.hosts.length > 0 ||
++								app.remoteAccess.warnings.length > 0 ||
++								app.remoteAccess.declarationErrors.length > 0 ||
++								app.remoteAccess.disabled) && (
++								<RemoteAccessSection
++									appId={app.appId}
++									remoteAccess={app.remoteAccess}
++									pending={setMut.isPending}
++									onToggle={(enabled) => toggleRemoteAccess(app.appId, enabled)}
++								/>
++							)}
+ 						</div>
+ 					))}
+ 				</div>
+@@ -277,4 +310,95 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
+ 	)
+ }
+ 
++type RemoteAccessStatus = {
++	disabled: boolean
++	source: 'heuristic' | 'manifest' | 'local-override' | null
++	hosts: Array<{port: number; origin: string; auth: 'umbrel' | 'app'; routed: boolean}>
++	warnings: string[]
++	declarationErrors: string[]
++}
++
++// Extra browser-facing ports found by the remote access analysis, with the
++// per-app off switch. Details load the saved analysis on demand.
++function RemoteAccessSection({
++	appId,
++	remoteAccess,
++	pending,
++	onToggle,
++}: {
++	appId: string
++	remoteAccess: RemoteAccessStatus
++	pending: boolean
++	onToggle: (enabled: boolean) => void
++}) {
++	const {t} = useTranslation()
++	const [open, setOpen] = React.useState(false)
++	const detailsQ = trpcReact.lanIngress.getRemoteAccess.useQuery({appId}, {enabled: open})
++	const saved = detailsQ.data?.saved
++	const environment = saved?.analysis.env.filter((entry) => entry.kind !== 'internal') ?? []
++	return (
++		<div className='flex w-full flex-col gap-y-2 border-t border-white/6 pt-3'>
++			<div className='flex w-full items-start gap-x-2'>
++				<div className='min-w-0 flex-1 space-y-1'>
++					<h4 className='text-13 leading-tight font-medium'>{t('remote-domain.remote-access')}</h4>
++					<p className='text-12 leading-tight opacity-45'>
++						{remoteAccess.disabled
++							? t('remote-domain.remote-access-disabled')
++							: remoteAccess.hosts.length > 0
++								? t('remote-domain.remote-access-help')
++								: t('remote-domain.remote-access-none')}
++					</p>
++				</div>
++				<Switch checked={!remoteAccess.disabled} disabled={pending} onCheckedChange={onToggle} />
++			</div>
++			{remoteAccess.hosts.map((host) => (
++				<p key={host.port} className='text-12 leading-tight break-all opacity-60'>
++					{t('remote-domain.remote-access-host', {port: host.port, origin: host.origin})}
++					{' · '}
++					{host.auth === 'app' ? t('remote-domain.remote-access-auth-app') : t('remote-domain.remote-access-auth-umbrel')}
++					{!host.routed && !remoteAccess.disabled ? ` · ${t('remote-domain.remote-access-not-routed')}` : ''}
++				</p>
++			))}
++			{[...remoteAccess.declarationErrors, ...remoteAccess.warnings].map((warning) => (
++				<div key={warning} className='flex items-start gap-2'>
++					<TbAlertTriangle className='mt-0.5 size-4 shrink-0 text-[#F5A623]' />
++					<span className='text-12 leading-tight break-words text-white/60'>{warning}</span>
++				</div>
++			))}
++			<details onToggle={(event) => setOpen((event.target as HTMLDetailsElement).open)}>
++				<summary className='cursor-pointer text-12 font-medium opacity-60'>
++					{t('remote-domain.remote-access-details', {
++						source: remoteAccess.source ? t(`remote-domain.remote-access-source-${remoteAccess.source}`) : '',
++					})}
++				</summary>
++				<div className='mt-2 flex flex-col gap-y-1'>
++					{saved ? (
++						<>
++							<p className='text-12 leading-tight opacity-45'>
++								{t('remote-domain.remote-access-analysed', {date: new Date(saved.analysedAt).toLocaleString()})}
++							</p>
++							{environment.map((entry) => (
++								<p key={`${entry.service}.${entry.name}`} className='text-12 leading-tight break-all opacity-60'>
++									<code>
++										{entry.service}.{entry.name}
++									</code>
++									{' · '}
++									{t(`remote-domain.remote-access-kind-${entry.kind}`)}
++									{saved.appliedEnvironment.some(
++										(applied) => applied.service === entry.service && applied.name === entry.name,
++									)
++										? ` · ${t('remote-domain.remote-access-applied')}`
++										: ''}
++								</p>
++							))}
++						</>
++					) : (
++						<p className='text-12 leading-tight opacity-45'>{t('remote-domain.remote-access-not-analysed')}</p>
++					)}
++				</div>
++			</details>
++		</div>
++	)
++}
++
+ const cardClass = tw`flex items-start gap-x-2 rounded-12 bg-white/6 p-4`
+diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts b/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts
+new file mode 100644
+index 0000000..51754d2
+--- /dev/null
++++ b/packages/umbreld/source/modules/app-gateway/app-gateway-remote-ports.unit.test.ts
+@@ -0,0 +1,349 @@
++import http from 'node:http'
++import net from 'node:net'
++
++import {afterEach, describe, expect, test, vi} from 'vitest'
++
++import {resolveRemoteDomain} from '../lan-ingress/remote-domain.js'
++import AppGateway from './app-gateway.js'
++import {
++	applyCorsHeaders,
++	handoffFormPage,
++	preflightHeaders,
++	remoteHostsMarker,
++	rewritePortUrl,
++	type GatewayPortRoute,
++} from './remote-ports.js'
++
++const remote = resolveRemoteDomain({enabled: true, baseDomain: 'example.com'})!
++const MAIN = 'lobe-chat-umbrel.example.com'
++const S3 = 'lobe-chat-7458-umbrel.example.com'
++const GW = 'lobe-chat-7459-umbrel.example.com'
++const SESSION = '__Host-UMBREL_APP_SESSION_HTTPS'
++const MARKER = '__Host-UMBREL_REMOTE_HOSTS'
++
++const route = (host: string, port: number, containerPort: number, auth: 'umbrel' | 'app' = 'umbrel'): GatewayPortRoute => ({
++	host,
++	origin: `https://${host}`,
++	port,
++	auth,
++	targetHost: `lobe-chat_x_1`,
++	targetAddress: '127.0.0.1',
++	containerPort,
++	lanOrigin: `http://umbrel.local:${port}`,
++})
++
++describe('remote port helpers', () => {
++	test('marker depends only on the hosts that need Umbrel login', () => {
++		const a = remoteHostsMarker([route(S3, 7458, 1), route(GW, 7459, 2)])
++		expect(a).toHaveLength(22)
++		expect(remoteHostsMarker([route(GW, 7459, 3), route(S3, 7458, 4)])).toBe(a)
++		expect(remoteHostsMarker([route(S3, 7458, 1, 'app')])).toBe('')
++	})
++
++	test('handoff page escapes fields and pins form-action to the target origin', () => {
++		const page = handoffFormPage(`https://${S3}/umbrel_/api/v1/auth/handoff`, {r: '/"><script>x</script>', handoff: 'h'})
++		expect(page.body).not.toContain('<script>x')
++		expect(page.headers['content-security-policy']).toContain(`form-action https://${S3};`)
++		expect(page.headers['cache-control']).toBe('no-store')
++	})
++
++	test('preflight echoes only well-formed methods and headers', () => {
++		const headers = preflightHeaders(
++			{headers: {'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type, x-amz-date'}} as never,
++			`https://${MAIN}`,
++		)
++		expect(headers).toMatchObject({'access-control-allow-methods': 'PUT', 'access-control-allow-headers': 'content-type, x-amz-date'})
++		const bad = preflightHeaders({headers: {'access-control-request-method': 'PUT\r\nX: y'}} as never, `https://${MAIN}`)
++		expect(bad['access-control-allow-methods']).toBeUndefined()
++	})
++
++	test('CORS replaces an upstream wildcard with the exact origin and exposes ETag', () => {
++		const headers: http.IncomingHttpHeaders = {'access-control-allow-origin': '*', vary: 'Accept'}
++		applyCorsHeaders(headers, `https://${MAIN}`)
++		expect(headers).toMatchObject({
++			'access-control-allow-origin': `https://${MAIN}`,
++			'access-control-allow-credentials': 'true',
++			vary: 'Accept, Origin',
++			'access-control-expose-headers': 'ETag',
++		})
++	})
++
++	test('LAN port URLs become the port host', () => {
++		expect(rewritePortUrl('http://umbrel.local:7458/lobe/a.png', [route(S3, 7458, 9000)])).toBe(`https://${S3}/lobe/a.png`)
++		expect(rewritePortUrl('https://elsewhere.example/a', [route(S3, 7458, 9000)])).toBe('https://elsewhere.example/a')
++	})
++})
++
++const navigate = {'sec-fetch-mode': 'navigate', accept: 'text/html'}
++
++describe('app gateway extra port hosts', () => {
++	const closers: Array<() => Promise<void>> = []
++	afterEach(async () => {
++		await Promise.all(closers.splice(0).map((close) => close()))
++	})
++	const closeServer = (server: http.Server) => () =>
++		new Promise<void>((resolve) => {
++			server.closeAllConnections?.()
++			server.close(() => resolve())
++		})
++
++	async function upstream(name: string) {
++		const seen: http.IncomingHttpHeaders[] = []
++		const server = http.createServer((request, response) => {
++			seen.push(request.headers)
++			response.setHeader('access-control-allow-origin', '*')
++			response.end(name)
++		})
++		server.on('upgrade', (request, socket) => {
++			seen.push(request.headers)
++			socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++		})
++		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++		closers.push(closeServer(server))
++		return {port: (server.address() as net.AddressInfo).port, seen}
++	}
++
++	async function start({auth = 'umbrel' as 'umbrel' | 'app', appAuth = true} = {}) {
++		const main = await upstream('main')
++		const s3 = await upstream('s3')
++		const gw = await upstream('gw')
++		const routes = [route(S3, 7458, s3.port, auth), route(GW, 7459, gw.port)]
++		const umbreld = {
++			logger: {error: vi.fn()},
++			dataDirectory: '/does-not-exist',
++			auth: {
++				appAccessRevision: 0,
++				authenticate: vi.fn(async (token: string | undefined) => {
++					if (token !== 'good') throw new Error('unauthenticated')
++					return {userId: 1}
++				}),
++				authorizeApp: vi.fn(),
++				issueAppHandoff: vi.fn(async () => 'next-handoff'),
++				consumeAppHandoff: vi.fn(async (_appId: string, handoff: string) => {
++					if (!handoff.endsWith('handoff')) throw new Error('bad handoff')
++					return {appGatewayToken: 'good'}
++				}),
++				registerAppSocket: vi.fn(() => true),
++			},
++		}
++		const gateway = new AppGateway(
++			umbreld as never,
++			{
++				appId: 'lobe-chat',
++				appName: 'Lobe Hub',
++				appIcon: 'https://example.com/icon.svg',
++				targetProtocol: 'http',
++				targetHost: 'lobe-chat_app_1',
++				targetAddress: '127.0.0.1',
++				targetPort: main.port,
++				auth: appAuth,
++				authWhitelist: [],
++				authBlacklist: [],
++				trustUpstream: false,
++				timeout: 2000,
++			},
++			{getRemoteDomain: () => remote, getRemotePorts: () => routes},
++		)
++		closers.push(closeServer(gateway.server))
++		await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
++		const base = `http://127.0.0.1:${(gateway.server.address() as net.AddressInfo).port}`
++		const request = (host: string, path = '/', init: RequestInit & {headers?: Record<string, string>} = {}) =>
++			fetch(`${base}${path}`, {
++				redirect: 'manual',
++				...init,
++				headers: {'x-forwarded-host': host, 'x-forwarded-proto': 'https', ...(init.headers ?? {})},
++			})
++		// fetch() forces Sec-Fetch-Mode: cors, so navigations use http.request.
++		const navigation = (host: string, path: string, headers: Record<string, string> = {}) =>
++			new Promise<{status: number; location?: string; body: string}>((resolve, reject) => {
++				const outgoing = http.request(`${base}${path}`, {
++					headers: {'x-forwarded-host': host, 'x-forwarded-proto': 'https', ...navigate, ...headers},
++				})
++				outgoing.on('response', async (response) => {
++					let body = ''
++					for await (const chunk of response) body += chunk
++					resolve({status: response.statusCode!, location: response.headers.location, body})
++				})
++				outgoing.on('error', reject)
++				outgoing.end()
++			})
++		return {request, navigation, base, main, s3, gw, umbreld}
++	}
++
++		test('an unauthenticated navigation to a port host goes to the auth host with the port', async () => {
++		const {navigation} = await start()
++		const response = await navigation(S3, '/lobe/file.png')
++		expect(response.status).toBe(302)
++		const location = new URL(response.location!)
++		expect(location.origin).toBe('https://umbrel-auth.example.com')
++		expect(location.searchParams.get('app')).toBe('lobe-chat')
++		expect(location.searchParams.get('port')).toBe('7458')
++		expect(location.searchParams.get('path')).toBe('/lobe/file.png')
++	})
++
++	test('an unauthenticated fetch gets 401, with CORS only for the app own origins', async () => {
++		const {request, s3} = await start()
++		const own = await request(S3, '/x', {headers: {origin: `https://${MAIN}`}})
++		expect(own.status).toBe(401)
++		expect(own.headers.get('access-control-allow-origin')).toBe(`https://${MAIN}`)
++		const foreign = await request(S3, '/x', {headers: {origin: 'https://other-umbrel.example.com'}})
++		expect(foreign.status).toBe(401)
++		expect(foreign.headers.get('access-control-allow-origin')).toBeNull()
++		expect(s3.seen).toHaveLength(0)
++	})
++
++	test('an authenticated request is proxied with the port host and without Umbrel cookies', async () => {
++		const {request, s3} = await start()
++		const response = await request(S3, '/lobe/file.png', {
++			headers: {cookie: `${SESSION}=good; ${MARKER}=m; app=1`, origin: `https://${MAIN}`},
++		})
++		expect(response.status).toBe(200)
++		expect(await response.text()).toBe('s3')
++		expect(response.headers.get('access-control-allow-origin')).toBe(`https://${MAIN}`)
++		expect(response.headers.get('access-control-allow-credentials')).toBe('true')
++		expect(s3.seen[0]).toMatchObject({host: S3, 'x-forwarded-host': S3, 'x-forwarded-proto': 'https', cookie: 'app=1'})
++	})
++
++	test('preflights from the app own origins are answered without credentials', async () => {
++		const {request, s3} = await start()
++		const ok = await request(S3, '/lobe/upload', {
++			method: 'OPTIONS',
++			headers: {origin: `https://${MAIN}`, 'access-control-request-method': 'PUT'},
++		})
++		expect(ok.status).toBe(204)
++		expect(ok.headers.get('access-control-allow-methods')).toBe('PUT')
++		const foreign = await request(S3, '/lobe/upload', {
++			method: 'OPTIONS',
++			headers: {origin: 'https://evil.example', 'access-control-request-method': 'PUT'},
++		})
++		expect(foreign.status).toBe(401)
++		expect(s3.seen).toHaveLength(0)
++	})
++
++	test('auth: app ports are proxied without an Umbrel session', async () => {
++		const {request, s3} = await start({auth: 'app'})
++		const response = await request(S3, '/lobe/upload', {method: 'PUT', body: 'x'})
++		expect(response.status).toBe(200)
++		expect(s3.seen).toHaveLength(1)
++	})
++
++	test('login on the main host hands the session to each port host, then returns', async () => {
++		const {request, umbreld} = await start()
++		const form = (fields: Record<string, string>) => ({
++			method: 'POST',
++			body: new URLSearchParams(fields).toString(),
++			headers: {'content-type': 'application/x-www-form-urlencoded'},
++		})
++		const first = await request(MAIN, '/umbrel_/api/v1/auth/handoff', form({handoff: 'login-handoff', r: '/chat'}))
++		expect(first.status).toBe(200)
++		const cookies = first.headers.getSetCookie().join('\n')
++		expect(cookies).toContain(`${SESSION}=good`)
++		expect(cookies).toContain(`${MARKER}=${remoteHostsMarker([route(S3, 7458, 0), route(GW, 7459, 0)])}`)
++		const page = await first.text()
++		expect(page).toContain(`action="https://${S3}/umbrel_/api/v1/auth/handoff"`)
++		expect(page).toContain('value="next-handoff"')
++		expect(page).not.toContain('login-handoff')
++
++		const second = await request(S3, '/umbrel_/api/v1/auth/handoff', form({handoff: 'next-handoff', r: '/chat', chain: '1'}))
++		expect(await second.text()).toContain(`action="https://${GW}/umbrel_/api/v1/auth/handoff"`)
++
++		const last = await request(GW, '/umbrel_/api/v1/auth/handoff', form({handoff: 'next-handoff', r: '/chat', chain: '1'}))
++		expect(last.status).toBe(200)
++		expect(last.headers.get('location')).toBeNull()
++		expect(await last.text()).toContain(`location.replace(${JSON.stringify(`https://${MAIN}/chat`)})`)
++		expect(umbreld.auth.consumeAppHandoff).toHaveBeenCalledTimes(3)
++	})
++
++	// Walks the chain the way a browser does. Chrome checks a redirect that
++	// follows a form POST against the submitting page's CSP form-action, so
++	// every hop must stay within it until the browser lands back on the app.
++	test('every hop of the login chain is allowed by the previous page CSP', async () => {
++		const {request} = await start()
++		const formAction = (csp: string | null) => /form-action ([^;]+)/.exec(csp ?? '')?.[1].trim().split(/\s+/) ?? []
++		let response = await request(MAIN, '/umbrel_/api/v1/auth/handoff', {
++			method: 'POST',
++			body: new URLSearchParams({handoff: 'login-handoff', r: '/chat'}).toString(),
++			headers: {'content-type': 'application/x-www-form-urlencoded'},
++		})
++		let allowed: string[] = ['*']
++		let landed: string | undefined
++		for (let hop = 0; hop < 10 && !landed; hop++) {
++			if (response.status >= 300 && response.status < 400) {
++				const location = new URL(response.headers.get('location')!)
++				expect(allowed, `redirect to ${location.origin}`).toSatisfy(
++					(list: string[]) => list.includes('*') || list.includes(location.origin),
++				)
++				landed = location.href
++				break
++			}
++			expect(response.status).toBe(200)
++			const csp = response.headers.get('content-security-policy')
++			const page = await response.text()
++			const navigate = /location\.replace\(("[^"]*")\)/.exec(page)
++			if (navigate) {
++				expect(formAction(csp)).toEqual(["'none'"])
++				landed = JSON.parse(navigate[1])
++				break
++			}
++			const action = /action="([^"]+)"/.exec(page)![1]
++			allowed = formAction(csp)
++			expect(allowed).toContain(new URL(action).origin)
++			const fields = Object.fromEntries(
++				[...page.matchAll(/name="([^"]+)" value="([^"]*)"/g)].map(([, name, value]) => [name, value]),
++			)
++			const url = new URL(action)
++			response = await request(url.host, url.pathname, {
++				method: 'POST',
++				body: new URLSearchParams(fields).toString(),
++				headers: {'content-type': 'application/x-www-form-urlencoded'},
++			})
++		}
++		expect(landed).toBe(`https://${MAIN}/chat`)
++	})
++
++	test('a main-host session without the current marker runs the chain once', async () => {
++		const {navigation, main} = await start()
++		const stale = await navigation(MAIN, '/chat', {cookie: `${SESSION}=good`})
++		expect(stale.status).toBe(200)
++		expect(stale.body).toContain(`action="https://${S3}/umbrel_/api/v1/auth/handoff"`)
++		expect(main.seen).toHaveLength(0)
++		const marker = remoteHostsMarker([route(S3, 7458, 0), route(GW, 7459, 0)])
++		const current = await navigation(MAIN, '/chat', {cookie: `${SESSION}=good; ${MARKER}=${marker}`})
++		expect(current.body).toBe('main')
++		expect(main.seen[0].cookie ?? '').not.toContain(MARKER)
++	})
++
++	test('LAN hosts use the main upstream; a port host follows the app auth setting', async () => {
++		const {request, s3} = await start({appAuth: false})
++		const response = await request('192.168.1.10:7455', '/', {headers: {'x-forwarded-proto': 'http'}})
++		expect(await response.text()).toBe('main')
++		const spoofed = await request(S3, '/', {headers: {'x-forwarded-host': S3}})
++		expect(spoofed.status).toBe(200)
++		// The spoofed host only matches on the remote domain and still needs a
++		// session unless the app runs without Umbrel login.
++		expect(s3.seen).toHaveLength(1)
++	})
++
++	test('WebSockets to a port host reject other origins and need a session', async () => {
++		const {base} = await start()
++		const upgrade = (headers: Record<string, string>) =>
++			new Promise<string>((resolve) => {
++				const request = http.request(`${base}/ws`, {
++					headers: {
++						connection: 'Upgrade',
++						upgrade: 'websocket',
++						'x-forwarded-host': GW,
++						'x-forwarded-proto': 'https',
++						...headers,
++					},
++				})
++				request.on('upgrade', (response) => resolve(String(response.statusCode)))
++				request.on('response', (response) => resolve(String(response.statusCode)))
++				request.on('error', () => resolve('error'))
++				request.end()
++			})
++		expect(await upgrade({origin: 'https://evil-umbrel.example.com', cookie: `${SESSION}=good`})).toBe('401')
++		expect(await upgrade({origin: `https://${MAIN}`})).toBe('401')
++		expect(await upgrade({origin: `https://${MAIN}`, cookie: `${SESSION}=good`})).toBe('101')
++	})
++})
+diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
+index 082f546..2de2c90 100644
+--- a/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
++++ b/packages/umbreld/source/modules/app-gateway/app-gateway-remote.unit.test.ts
+@@ -147,7 +147,11 @@ describe('app gateway remote Origin/Referer rewrite', () => {
+ 		return {port: (upstream.address() as net.AddressInfo).port, seen}
+ 	}
+ 
+-	async function startGateway(targetPort: number, getRemoteDomain: () => RemoteDomain | undefined) {
++	async function startGateway(
++		targetPort: number,
++		getRemoteDomain: () => RemoteDomain | undefined,
++		{usesRemoteOrigin = false} = {},
++	) {
+ 		const umbreld = {
+ 			logger: {error: vi.fn()},
+ 			dataDirectory: '/does-not-exist',
+@@ -169,7 +173,7 @@ describe('app gateway remote Origin/Referer rewrite', () => {
+ 				trustUpstream: false,
+ 				timeout: 1000,
+ 			},
+-			{getRemoteDomain, getLanOrigin: () => 'http://umbrel.local:3015'},
++			{getRemoteDomain, getLanOrigin: () => 'http://umbrel.local:3015', getUsesRemoteOrigin: () => usesRemoteOrigin},
+ 		)
+ 		gateway.server.listen(0, '127.0.0.1')
+ 		await once(gateway.server, 'listening')
+@@ -245,8 +249,8 @@ describe('app gateway remote Origin/Referer rewrite', () => {
+ 			host: 'umbrel.local:3015',
+ 			origin: 'http://umbrel.local:3015',
+ 			referer: 'http://umbrel.local:3015/chat/1?tab=files',
+-			'x-forwarded-host': remoteHost,
+-			'x-forwarded-proto': 'https',
++			'x-forwarded-host': 'umbrel.local:3015',
++			'x-forwarded-proto': 'http',
+ 		})
+ 	})
+ 
+@@ -257,8 +261,8 @@ describe('app gateway remote Origin/Referer rewrite', () => {
+ 		expect(upstream.seen[0]).toMatchObject({
+ 			host: 'umbrel.local:3015',
+ 			origin: 'http://umbrel.local:3015',
+-			'x-forwarded-host': remoteHost,
+-			'x-forwarded-proto': 'https',
++			'x-forwarded-host': 'umbrel.local:3015',
++			'x-forwarded-proto': 'http',
+ 		})
+ 	})
+ 
+@@ -322,6 +326,74 @@ describe('app gateway remote Origin/Referer rewrite', () => {
+ 		expect(await upgradeStatus(port, remoteHeaders({origin: 'https://immich-umbrel.example.com'}))).toBe(403)
+ 	})
+ 
++	// OpenClaw's gateway: Origin must equal X-Forwarded-Proto + '://' + Host.
++	const forwardedOrigin = (headers: http.IncomingHttpHeaders) =>
++		!headers.origin || headers.origin === `${headers['x-forwarded-proto']}://${headers.host}`
++
++	// Host, Origin, X-Forwarded-Host and X-Forwarded-Proto always describe one origin.
++	const presentedAs = (headers: http.IncomingHttpHeaders) => ({
++		host: headers.host,
++		origin: headers.origin,
++		forwarded: `${headers['x-forwarded-proto']}://${headers['x-forwarded-host']}`,
++	})
++
++	describe('forwarded headers move with Host and Origin', () => {
++		const optedOut = () =>
++			resolveRemoteDomain({enabled: true, baseDomain: 'example.com', originRewriteDisabledApps: ['agent-zero']})!
++		const modes = [
++			{
++				name: 'rewrite active',
++				domain: () => remote,
++				usesRemoteOrigin: false,
++				expected: {host: 'umbrel.local:3015', origin: 'http://umbrel.local:3015', forwarded: 'http://umbrel.local:3015'},
++			},
++			{
++				name: 'rewrite disabled by the owner',
++				domain: optedOut,
++				usesRemoteOrigin: false,
++				expected: {host: remoteHost, origin: `https://${remoteHost}`, forwarded: `https://${remoteHost}`},
++			},
++			{
++				name: 'app base URL rewritten to the remote origin',
++				domain: () => remote,
++				usesRemoteOrigin: true,
++				expected: {host: remoteHost, origin: `https://${remoteHost}`, forwarded: `https://${remoteHost}`},
++			},
++		]
++
++		for (const mode of modes) {
++			test(`${mode.name}: HTTP and WebSocket upgrades see one consistent origin`, async () => {
++				const upstream = await startUpstream({allow: forwardedOrigin})
++				const port = await startGateway(upstream.port, mode.domain, {usesRemoteOrigin: mode.usesRemoteOrigin})
++				const origin = `https://${remoteHost}`
++				expect((await get(port, remoteHeaders({origin}), 'POST')).statusCode).toBe(200)
++				expect(await upgradeStatus(port, remoteHeaders({origin}))).toBe(101)
++				expect(presentedAs(upstream.seen[0]!)).toEqual(mode.expected)
++				expect(presentedAs(upstream.seen[1]!)).toEqual(mode.expected)
++				// X-Forwarded-For handling is unchanged: HTTP carries the peer, upgrades as before.
++				expect(upstream.seen[0]!['x-forwarded-for']).toBe('127.0.0.1')
++				expect(upstream.seen[1]!['x-forwarded-for']).toBeUndefined()
++				// The app still refuses foreign origins.
++				expect((await get(port, remoteHeaders({origin: 'https://evil.com'}), 'POST')).statusCode).toBe(403)
++				expect(await upgradeStatus(port, remoteHeaders({origin: 'https://immich-umbrel.example.com'}))).toBe(403)
++			})
++		}
++
++		test('LAN requests keep their own forwarded headers', async () => {
++			const upstream = await startUpstream({allow: forwardedOrigin})
++			const port = await startGateway(upstream.port, () => remote, {usesRemoteOrigin: true})
++			// As LAN ingress forwards a LAN browser's request.
++			const lan = {
++				host: 'umbrel.local:3015',
++				origin: 'http://umbrel.local:3015',
++				'x-forwarded-host': 'umbrel.local:3015',
++				'x-forwarded-proto': 'http',
++			}
++			expect(await upgradeStatus(port, lan)).toBe(101)
++			expect(upstream.seen[0]).toMatchObject(lan)
++		})
++	})
++
+ 	// Agent Zero and many others compare Origin with a LAN allowlist built from
+ 	// DEVICE_DOMAIN_NAME, which is why the gateway presents the LAN origin.
+ 	test('still passes apps that only allow their LAN origins', async () => {
+diff --git a/packages/umbreld/source/modules/app-gateway/app-gateway.ts b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
+index 28f3908..616dd43 100644
+--- a/packages/umbreld/source/modules/app-gateway/app-gateway.ts
++++ b/packages/umbreld/source/modules/app-gateway/app-gateway.ts
+@@ -13,9 +13,21 @@ import type Umbreld from '../../index.js'
+ import {
+ 	appGatewayTokenFromCookieHeader,
+ 	appGatewayTokenFromRequest,
++	REMOTE_HOSTS_COOKIE_NAME,
+ 	setAppGatewayCookie,
+ 	stripAppGatewayCookies,
+ } from '../auth/app-gateway-cookie.js'
++import {
++	applyCorsHeaders,
++	corsOrigin,
++	handoffFormPage,
++	returnPage,
++	isTopLevelNavigation,
++	preflightHeaders,
++	remoteHostsMarker,
++	rewritePortUrl,
++	type GatewayPortRoute,
++} from './remote-ports.js'
+ import {SESSION_DURATION} from '../auth/auth.js'
+ import {appGatewayErrorPage} from './error-page.js'
+ import safeRedirectPath from '../utilities/safe-redirect-path.js'
+@@ -55,6 +67,12 @@ type AppGatewayOptions = {
+ 	// The origin a LAN browser uses for this app, e.g. http://umbrel.local:3015.
+ 	// Remote requests present this Host/Origin/Referer to the app.
+ 	getLanOrigin?: () => string | undefined
++	// True while the app runs with its base URL on its remote origin (a
++	// base-url rewrite was applied when it started).
++	getUsesRemoteOrigin?: () => boolean
++	// The app's extra browser-facing port hosts routed right now (remote
++	// access analysis). Read per request, like the remote domain.
++	getRemotePorts?: () => GatewayPortRoute[]
+ }
+ 
+ function environmentRecord(environment: unknown) {
+@@ -183,7 +201,10 @@ export default class AppGateway {
+ 	#onUpstreamUnavailable?: () => void
+ 	#getRemoteDomain?: () => RemoteDomain | undefined
+ 	#getLanOrigin?: () => string | undefined
++	#getUsesRemoteOrigin?: () => boolean
++	#getRemotePorts?: () => GatewayPortRoute[]
+ 	#proxy: ReturnType<typeof createProxyMiddleware>
++	#portProxies = new Map<string, ReturnType<typeof createProxyMiddleware>>()
+ 	server: http.Server
+ 
+ 	constructor(umbreld: Umbreld, config: AppGatewayConfig, options: AppGatewayOptions = {}) {
+@@ -192,6 +213,8 @@ export default class AppGateway {
+ 		this.#onUpstreamUnavailable = options.onUpstreamUnavailable
+ 		this.#getRemoteDomain = options.getRemoteDomain
+ 		this.#getLanOrigin = options.getLanOrigin
++		this.#getUsesRemoteOrigin = options.getUsesRemoteOrigin
++		this.#getRemotePorts = options.getRemotePorts
+ 		this.#proxy = this.createProxy()
+ 
+ 		const app = express()
+@@ -311,17 +334,29 @@ export default class AppGateway {
+ 
+ 	// The proxy only runs after the request passed Umbrel app auth (or the app
+ 	// has auth off and the owner allowed it on the remote domain). On the app's
+-	// own remote host, present the request to the app the way a LAN browser
+-	// would: Host becomes the LAN host and a same-app Origin/Referer the LAN
+-	// origin, so allowlists of LAN origins and "Origin must match Host" checks
+-	// both pass. X-Forwarded-* carry the public host and https.
++	// own remote host, Host, Origin/Referer, X-Forwarded-Host and
++	// X-Forwarded-Proto move as one unit, for HTTP and WebSocket alike:
++	// - LAN presentation: all four name the LAN origin, as a LAN browser sends
++	//   them, so LAN-origin allowlists, "Origin must match Host" and
++	//   "Origin must equal X-Forwarded-Proto://Host" checks all pass.
++	//   X-Forwarded-Host is set to the LAN host, not dropped, so an app that
++	//   prefers it over Host reads the same value.
++	// - Remote presentation (rewrite off, or the app's base URL is remote): Host
++	//   and Origin stay as the browser sent them; the forwarded pair names the
++	//   remote host and https.
++	// X-Forwarded-For and the client IP are not touched here.
+ 	private applyRemoteHeaders(proxyRequest: http.ClientRequest, request: http.IncomingMessage) {
+ 		const rewrite = this.remoteRewrite(request)
+ 		if (!rewrite) return
+-		proxyRequest.setHeader('x-forwarded-host', rewrite.remoteHost)
+-		proxyRequest.setHeader('x-forwarded-proto', 'https')
+-		if (!rewrite.lanOrigin) return
+-		proxyRequest.setHeader('host', new URL(rewrite.lanOrigin).host)
++		if (!rewrite.lanOrigin) {
++			proxyRequest.setHeader('x-forwarded-host', rewrite.remoteHost)
++			proxyRequest.setHeader('x-forwarded-proto', 'https')
++			return
++		}
++		const lan = new URL(rewrite.lanOrigin)
++		proxyRequest.setHeader('host', lan.host)
++		proxyRequest.setHeader('x-forwarded-host', lan.host)
++		proxyRequest.setHeader('x-forwarded-proto', lan.protocol.slice(0, -1))
+ 		const headers = rewriteRemoteOriginHeaders(request.headers, rewrite.remoteOrigin, rewrite.lanOrigin)
+ 		if (headers.origin) proxyRequest.setHeader('origin', headers.origin)
+ 		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
+@@ -333,6 +368,7 @@ export default class AppGateway {
+ 			this.#config.appId,
+ 			browserHost(request),
+ 			this.#getLanOrigin?.(),
++			this.#getUsesRemoteOrigin?.() ?? false,
+ 		)
+ 	}
+ 
+@@ -346,8 +382,12 @@ export default class AppGateway {
+ 		const local = {...this.#config, lanOrigin: this.#getLanOrigin?.()}
+ 		const {location, refresh} = proxyResponse.headers
+ 		if (typeof location === 'string') {
+-			proxyResponse.headers.location = rewriteLocalAppUrl(location, local, rewrite.remoteOrigin)
++			const portLocation = rewritePortUrl(location, this.remotePorts(request))
++			proxyResponse.headers.location =
++				portLocation !== location ? portLocation : rewriteLocalAppUrl(location, local, rewrite.remoteOrigin)
+ 		}
++		const origin = corsOrigin(request, this.remotePortOrigins(request))
++		if (origin) applyCorsHeaders(proxyResponse.headers, origin)
+ 		if (typeof refresh === 'string') {
+ 			proxyResponse.headers.refresh = rewriteLocalRefresh(refresh, local, rewrite.remoteOrigin)
+ 		}
+@@ -387,12 +427,191 @@ export default class AppGateway {
+ 		if (typeof request.body?.handoff !== 'string') return response.status(400).send('Invalid handoff')
+ 		const handoff = await this.#umbreld.auth.consumeAppHandoff(this.#config.appId, request.body.handoff)
+ 		setAppGatewayCookie(response, request, handoff.appGatewayToken, new Date(Date.now() + SESSION_DURATION))
+-		response.redirect(safeRedirect(request.body.r))
++		const redirect = safeRedirect(request.body.r)
++
++		// Extra port hosts need their own host-only cookie. After a login on the
++		// main host, hand the same session on to each port host in turn with a
++		// fresh single-use handoff, then come back to the main host.
++		const remote = this.#getRemoteDomain?.()
++		const mainHost = remote ? appRemoteHost(remote, this.#config.appId) : undefined
++		const host = normaliseHostHeader(browserHost(request))
++		const chain = this.remotePorts(request).filter((route) => route.auth === 'umbrel')
++		if (mainHost && chain.length && request.secure) {
++			if (host === mainHost && request.body.chain !== '1') {
++				return this.startHandoffChain(response, handoff.appGatewayToken, chain, redirect)
++			}
++			const index = chain.findIndex((route) => route.host === host)
++			if (index >= 0 && request.body.chain === '1') {
++				const next = chain[index + 1]
++				if (next) return this.sendHandoff(response, next.origin, handoff.appGatewayToken, redirect)
++				const page = returnPage(`https://${mainHost}${redirect}`)
++				return response.status(200).set(page.headers).send(page.body)
++			}
++		}
++		response.redirect(redirect)
++	}
++
++	private async startHandoffChain(
++		response: express.Response,
++		appGatewayToken: string,
++		chain: GatewayPortRoute[],
++		redirect: string,
++	) {
++		response.cookie(REMOTE_HOSTS_COOKIE_NAME, remoteHostsMarker(chain), {
++			httpOnly: true,
++			path: '/',
++			sameSite: 'lax',
++			secure: true,
++			expires: new Date(Date.now() + SESSION_DURATION),
++		})
++		return this.sendHandoff(response, chain[0]!.origin, appGatewayToken, redirect)
++	}
++
++	private async sendHandoff(response: express.Response, origin: string, appGatewayToken: string, redirect: string) {
++		const handoff = await this.#umbreld.auth.issueAppHandoff(this.#config.appId, appGatewayToken)
++		const page = handoffFormPage(`${origin}/umbrel_/api/v1/auth/handoff`, {r: redirect, handoff, chain: '1'})
++		response.status(200).set(page.headers).send(page.body)
++	}
++
++	// Extra port routes, only for requests on the remote domain.
++	private remotePorts(request: http.IncomingMessage) {
++		const remote = this.#getRemoteDomain?.()
++		if (!remote || !isRemoteDomainRequest(remote, normaliseHostHeader(browserHost(request)))) return []
++		return this.#getRemotePorts?.() ?? []
++	}
++
++	private remotePortRoute(request: http.IncomingMessage) {
++		const routes = this.remotePorts(request)
++		if (!routes.length) return
++		const host = normaliseHostHeader(browserHost(request))
++		return routes.find((route) => route.host === host)
++	}
++
++	// Origins that may make credentialed requests to this app's remote hosts:
++	// the app's own main host and port hosts.
++	private remotePortOrigins(request: http.IncomingMessage) {
++		const routes = this.remotePorts(request)
++		const remote = this.#getRemoteDomain?.()
++		if (!routes.length || !remote) return []
++		const mainHost = appRemoteHost(remote, this.#config.appId)
++		return [...(mainHost ? [`https://${mainHost}`] : []), ...routes.map((route) => route.origin)]
++	}
++
++	private portProxy(route: GatewayPortRoute) {
++		const key = `${route.targetAddress}:${route.containerPort}:${route.host}`
++		const existing = this.#portProxies.get(key)
++		if (existing) return existing
++		const proxy = createProxyMiddleware({
++			target: `http://${hostWithPort(route.targetAddress, route.containerPort)}`,
++			changeOrigin: false,
++			ws: true,
++			xfwd: false,
++			proxyTimeout: this.#config.timeout,
++			followRedirects: false,
++			// The port's own service sees its public host, unchanged: e.g. an S3
++			// server verifies SigV4 signatures that were made for this host.
++			onProxyReq: (proxyRequest, request, response) => {
++				if (request.socket.remoteAddress === undefined) return response.end()
++				proxyRequest.setHeader('host', route.host)
++				proxyRequest.setHeader('x-forwarded-proto', 'https')
++				proxyRequest.setHeader('x-forwarded-host', route.host)
++				proxyRequest.setHeader('x-forwarded-for', request.socket.remoteAddress)
++				this.stripCookies(proxyRequest, request)
++			},
++			onProxyReqWs: (proxyRequest, request) => {
++				proxyRequest.setHeader('host', route.host)
++				proxyRequest.setHeader('x-forwarded-proto', 'https')
++				proxyRequest.setHeader('x-forwarded-host', route.host)
++				this.stripCookies(proxyRequest, request)
++			},
++			onProxyRes: (proxyResponse, request) => {
++				const routes = this.remotePorts(request)
++				const {location} = proxyResponse.headers
++				if (typeof location === 'string') proxyResponse.headers.location = rewritePortUrl(location, routes)
++				if (route.auth === 'umbrel') {
++					const origin = corsOrigin(request, this.remotePortOrigins(request))
++					if (origin) applyCorsHeaders(proxyResponse.headers, origin)
++				}
++			},
++			onError: (error, _request, response) => this.handleUpstreamError(response, error),
++		})
++		// Keep the cache small: drop proxies for targets that no longer exist.
++		const live = new Set((this.#getRemotePorts?.() ?? []).map((r) => `${r.targetAddress}:${r.containerPort}:${r.host}`))
++		for (const cached of this.#portProxies.keys()) if (!live.has(cached)) this.#portProxies.delete(cached)
++		this.#portProxies.set(key, proxy)
++		return proxy
++	}
++
++	// Umbrel login on a port host: the app's own setting (auth off and allowed
++	// by the owner) or an `auth: app` declaration skip it. Otherwise a valid
++	// session cookie for this host is required. Public paths never apply here.
++	private async portAuthorized(request: http.IncomingMessage, route: GatewayPortRoute) {
++		if (route.auth === 'app' || !this.#config.auth) return {principal: undefined}
++		const token =
++			'cookies' in request
++				? appGatewayTokenFromRequest(request as express.Request)
++				: appGatewayTokenFromCookieHeader(
++						request.headers.cookie,
++						request.socket.remoteAddress === '127.0.0.1' && request.headers['x-forwarded-proto'] === 'https',
++					)
++		const principal = await this.#umbreld.auth.authenticate(token, 'app-gateway')
++		await this.#umbreld.auth.authorizeApp(principal, this.#config.appId)
++		return {principal}
++	}
++
++	private async handlePortRequest(request: express.Request, response: express.Response, route: GatewayPortRoute) {
++		const origin = route.auth === 'umbrel' ? corsOrigin(request, this.remotePortOrigins(request)) : undefined
++		// Browsers send CORS preflights without cookies; answer them for the
++		// app's own origins so credentialed cross-host requests can follow.
++		if (origin && request.method === 'OPTIONS' && request.headers['access-control-request-method']) {
++			response.status(204).set(preflightHeaders(request, origin)).end()
++			return
++		}
++		try {
++			await this.portAuthorized(request, route)
++		} catch {
++			const remote = this.#getRemoteDomain?.()
++			if (remote && isTopLevelNavigation(request)) {
++				response.redirect(remoteAppAuthUrl(remote, this.#config.appId, safeRedirect(request.originalUrl), route.port))
++				return
++			}
++			if (origin) response.set({'access-control-allow-origin': origin, 'access-control-allow-credentials': 'true', vary: 'Origin'})
++			response.status(401).set('cache-control', 'no-store').send('Unauthorized')
++			return
++		}
++		this.portProxy(route)(request, response, (error) => {
++			if (error) this.sendUpstreamError(response, error)
++		})
++	}
++
++	// After a main-host navigation with a valid session, make sure every port
++	// host has a session too (sessions from before the ports existed, or a new
++	// port). Returns true when it answered with the handoff chain.
++	private async ensurePortSessions(request: express.Request, response: express.Response) {
++		if (!request.secure || !isTopLevelNavigation(request) || request.method !== 'GET') return false
++		const remote = this.#getRemoteDomain?.()
++		if (!remote || !this.#config.auth) return false
++		const mainHost = appRemoteHost(remote, this.#config.appId)
++		if (!mainHost || normaliseHostHeader(browserHost(request)) !== mainHost) return false
++		const chain = this.remotePorts(request).filter((route) => route.auth === 'umbrel')
++		if (!chain.length || request.cookies?.[REMOTE_HOSTS_COOKIE_NAME] === remoteHostsMarker(chain)) return false
++		const token = appGatewayTokenFromRequest(request)
++		if (!token) return false
++		await this.startHandoffChain(response, token, chain, safeRedirect(request.originalUrl))
++		return true
+ 	}
+ 
+ 	private async handleRequest(request: express.Request, response: express.Response) {
++		const portRoute = this.remotePortRoute(request)
++		if (portRoute) return this.handlePortRequest(request, response, portRoute)
++		const portOrigin = corsOrigin(request, this.remotePortOrigins(request))
++		if (portOrigin && request.method === 'OPTIONS' && request.headers['access-control-request-method']) {
++			response.status(204).set(preflightHeaders(request, portOrigin)).end()
++			return
++		}
++		let principal: Awaited<ReturnType<AppGateway['isAuthorized']>>
+ 		try {
+-			await this.isAuthorized(request)
++			principal = await this.isAuthorized(request)
+ 		} catch {
+ 			const remoteRedirect = remoteLoginRedirect(
+ 				this.#getRemoteDomain?.(),
+@@ -422,6 +641,7 @@ export default class AppGateway {
+ 			response.redirect(`${request.protocol}://${host}/app-auth?${searchParams}`)
+ 			return
+ 		}
++		if (principal && (await this.ensurePortSessions(request, response).catch(() => false))) return
+ 		this.#proxy(request, response, (error) => {
+ 			if (error) this.sendUpstreamError(response, error)
+ 		})
+@@ -429,6 +649,21 @@ export default class AppGateway {
+ 
+ 	private async handleUpgrade(request: http.IncomingMessage, socket: net.Socket, head: Buffer) {
+ 		const appAccessRevision = this.#umbreld.auth.appAccessRevision
++		const portRoute = this.remotePortRoute(request)
++		if (portRoute) {
++			// Same-site pages on other hosts of the base domain could otherwise
++			// open a socket with this host's Lax cookie.
++			const origin = request.headers.origin
++			if (portRoute.auth === 'umbrel' && origin && !corsOrigin(request, this.remotePortOrigins(request))) {
++				throw new Error('Cross-origin WebSocket')
++			}
++			const {principal} = await this.portAuthorized(request, portRoute)
++			if (principal && !this.#umbreld.auth.registerAppSocket(principal, this.#config.appId, socket, appAccessRevision)) {
++				return
++			}
++			this.portProxy(portRoute).upgrade?.(request as express.Request, socket, head)
++			return
++		}
+ 		const principal = await this.isAuthorized(request)
+ 		// Re-check and register synchronously after asynchronous authentication so
+ 		// session or app-share revocation cannot race a late app WebSocket into
+diff --git a/packages/umbreld/source/modules/app-gateway/remote-ports.ts b/packages/umbreld/source/modules/app-gateway/remote-ports.ts
+new file mode 100644
+index 0000000..de95171
+--- /dev/null
++++ b/packages/umbreld/source/modules/app-gateway/remote-ports.ts
+@@ -0,0 +1,142 @@
++import crypto from 'node:crypto'
++import type http from 'node:http'
++
++import {rewriteLocalAppUrl, type LocalAppAddress} from '../lan-ingress/remote-domain.js'
++
++// Helpers for an app's extra browser-facing port hosts on the remote domain
++// (https://<app>-<port>-umbrel.<base>), see lan-ingress/remote-access.ts.
++
++export type GatewayPortRoute = {
++	host: string
++	origin: string
++	port: number
++	auth: 'umbrel' | 'app'
++	targetHost: string
++	targetAddress: string
++	containerPort: number
++	lanOrigin: string
++}
++
++// Identifies the set of port hosts that need an Umbrel session. When the
++// marker cookie on the main host differs, the gateway re-runs the handoff
++// chain (new ports, or a session from before ports existed).
++export function remoteHostsMarker(routes: GatewayPortRoute[]) {
++	const hosts = routes
++		.filter((route) => route.auth === 'umbrel')
++		.map((route) => route.host)
++		.sort()
++	if (!hosts.length) return ''
++	return crypto.createHash('sha256').update(hosts.join('\n')).digest('base64url').slice(0, 22)
++}
++
++function escapeHtml(value: string) {
++	return value.replace(/[&<>"']/g, (character) => `&#${character.charCodeAt(0)};`)
++}
++
++// A page that POSTs a single-use handoff to the next host. The handoff never
++// goes in a URL. CSP allows only this script and only this form target.
++// The last hop of the handoff chain. A redirect would be checked against the
++// previous page's CSP form-action (Chrome applies form-action to redirects
++// after a form POST), which only allows that hop's own target. A 200 page that
++// navigates with script is not a form submission, so it is not limited by
++// form-action. The caller passes only the app's own main remote origin and a
++// path checked by safeRedirect, so this is never an open redirect.
++export function returnPage(url: string) {
++	const nonce = crypto.randomBytes(16).toString('base64')
++	const target = JSON.stringify(url).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
++	const body =
++		`<!doctype html><html><head><meta charset="utf-8"><title>Signing in…</title></head><body>` +
++		`<noscript><a href="${escapeHtml(url)}">Continue</a></noscript>` +
++		`<script nonce="${nonce}">location.replace(${target})</script></body></html>`
++	return {
++		body,
++		headers: {
++			'cache-control': 'no-store',
++			'content-type': 'text/html; charset=utf-8',
++			'referrer-policy': 'no-referrer',
++			'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'`,
++			'x-content-type-options': 'nosniff',
++		},
++	}
++}
++
++export function handoffFormPage(action: string, fields: Record<string, string>) {
++	const nonce = crypto.randomBytes(16).toString('base64')
++	const inputs = Object.entries(fields)
++		.map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
++		.join('')
++	const body =
++		`<!doctype html><html><head><meta charset="utf-8"><title>Signing in…</title></head><body>` +
++		`<form id="handoff" method="post" action="${escapeHtml(action)}">${inputs}` +
++		`<noscript><button type="submit">Continue</button></noscript></form>` +
++		`<script nonce="${nonce}">document.getElementById('handoff').submit()</script></body></html>`
++	const origin = new URL(action).origin
++	return {
++		body,
++		headers: {
++			'cache-control': 'no-store',
++			'content-type': 'text/html; charset=utf-8',
++			'referrer-policy': 'no-referrer',
++			'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; form-action ${origin}; base-uri 'none'; frame-ancestors 'none'`,
++			'x-content-type-options': 'nosniff',
++		},
++	}
++}
++
++export function isTopLevelNavigation(request: http.IncomingMessage) {
++	if (request.method !== 'GET' && request.method !== 'HEAD') return false
++	const mode = request.headers['sec-fetch-mode']
++	if (typeof mode === 'string') return mode === 'navigate'
++	return String(request.headers.accept ?? '').includes('text/html')
++}
++
++// CORS between an app's own remote hosts (main host and port hosts). Only
++// exact origins of the same app are echoed, with credentials.
++export function corsOrigin(request: http.IncomingMessage, allowedOrigins: string[]) {
++	const origin = request.headers.origin
++	return typeof origin === 'string' && allowedOrigins.includes(origin) ? origin : undefined
++}
++
++export function preflightHeaders(request: http.IncomingMessage, origin: string) {
++	const headers: Record<string, string> = {
++		'access-control-allow-origin': origin,
++		'access-control-allow-credentials': 'true',
++		'access-control-max-age': '600',
++		vary: 'Origin',
++	}
++	const method = request.headers['access-control-request-method']
++	if (typeof method === 'string' && /^[A-Za-z]+$/.test(method)) headers['access-control-allow-methods'] = method
++	const requested = request.headers['access-control-request-headers']
++	if (typeof requested === 'string' && /^[A-Za-z0-9\-_, ]*$/.test(requested) && requested.trim()) {
++		headers['access-control-allow-headers'] = requested
++	}
++	return headers
++}
++
++export function applyCorsHeaders(headers: http.IncomingHttpHeaders, origin: string) {
++	headers['access-control-allow-origin'] = origin
++	headers['access-control-allow-credentials'] = 'true'
++	const vary = typeof headers.vary === 'string' ? headers.vary : ''
++	if (!/\borigin\b/i.test(vary)) headers.vary = vary ? `${vary}, Origin` : 'Origin'
++	// S3-style multipart uploads read ETag from JavaScript.
++	const exposed = typeof headers['access-control-expose-headers'] === 'string' ? headers['access-control-expose-headers'] : ''
++	if (!/\betag\b/i.test(exposed) && exposed.trim() !== '*') {
++		headers['access-control-expose-headers'] = exposed ? `${exposed}, ETag` : 'ETag'
++	}
++}
++
++// A response URL pointing at one of the app's extra ports on the LAN (or at
++// the port's container) becomes that port's remote origin.
++export function rewritePortUrl(value: string, routes: GatewayPortRoute[]) {
++	for (const route of routes) {
++		const local: LocalAppAddress = {
++			lanOrigin: route.lanOrigin,
++			targetHost: route.targetHost,
++			targetAddress: route.targetAddress,
++			targetPort: route.containerPort,
++		}
++		const rewritten = rewriteLocalAppUrl(value, local, route.origin)
++		if (rewritten !== value) return rewritten
++	}
++	return value
++}
+diff --git a/packages/umbreld/source/modules/apps/app-settings.unit.test.ts b/packages/umbreld/source/modules/apps/app-settings.unit.test.ts
+index da06de2..8c2f0a3 100644
+--- a/packages/umbreld/source/modules/apps/app-settings.unit.test.ts
++++ b/packages/umbreld/source/modules/apps/app-settings.unit.test.ts
+@@ -9,6 +9,8 @@ import {afterEach, describe, expect, test, vi} from 'vitest'
+ import type Umbreld from '../../index.js'
+ import App, {normalizeAppMountTargetPath, normalizeAppStorageSourcePath} from './app.js'
+ import ImageCleanup from './image-cleanup.js'
++import {readSavedRemoteAccessAnalysis} from '../lan-ingress/remote-access-files.js'
++import {resolveRemoteDomain} from '../lan-ingress/remote-domain.js'
+ import type {AppManifest} from './schema.js'
+ 
+ const temporaryDirectories: string[] = []
+@@ -199,6 +201,62 @@ describe('app settings', () => {
+ 	})
+ })
+ 
++describe('remote access overrides', () => {
++	async function remoteApp(remoteAccessDisabledApps: string[] = []) {
++		const {app, umbreld} = await createApp()
++		Object.assign(umbreld.lanIngress, {
++			remoteDomain: resolveRemoteDomain({enabled: true, baseDomain: 'example.com', remoteAccessDisabledApps}),
++			lanHostname: 'umbrel.local',
++		})
++		await fse.writeFile(path.join(app.dataDirectory, 'umbrel-app.yml'), yaml.dump({manifestVersion: '1.0.0', port: 7000}))
++		await app.writeCompose({
++			services: {
++				app_proxy: {image: 'example/proxy', environment: {APP_HOST: 'test-app_server_1', APP_PORT: 80}},
++				server: {
++					image: 'example/server',
++					environment: {
++						PUBLIC_UPLOAD_URL: 'http://${DEVICE_DOMAIN_NAME}:7001/upload',
++						PUBLIC_WS_URL: 'ws://${DEVICE_DOMAIN_NAME}:7002',
++						APP_URL: 'http://${DEVICE_DOMAIN_NAME}:7000',
++					},
++				},
++				upload: {image: 'example/upload', ports: ['7001:9000']},
++				socket: {image: 'example/socket', ports: ['7002:9001']},
++			},
++		})
++		return {app, umbreld}
++	}
++
++	test('writes rewrites for extra browser ports and lets user values win', async () => {
++		const {app, umbreld} = await remoteApp()
++		await app.store.set('customEnvironment', [{serviceName: 'server', name: 'PUBLIC_WS_URL', value: 'wss://mine.example'}])
++		await app.regenerateUserSettingsCompose()
++		const generated = yaml.load(await fse.readFile(app.userSettingsComposePath, 'utf8')) as any
++		expect(generated.services.server.environment).toMatchObject({
++			PUBLIC_UPLOAD_URL: 'https://test-app-7001-umbrel.example.com/upload',
++			PUBLIC_WS_URL: 'wss://mine.example',
++		})
++		// The main port is already served by the app gateway: left alone.
++		expect(generated.services.server.environment.APP_URL).toBeUndefined()
++		// The saved analysis lists variable names only.
++		const saved = await readSavedRemoteAccessAnalysis(umbreld, 'test-app')
++		expect(saved?.appliedEnvironment).toEqual(
++			expect.arrayContaining([
++				{service: 'server', name: 'PUBLIC_UPLOAD_URL'},
++				{service: 'server', name: 'PUBLIC_WS_URL'},
++			]),
++		)
++		expect(saved?.analysis.ports.filter((port) => port.role === 'browser').map((port) => port.port)).toEqual([7001, 7002])
++	})
++
++	test('the per-app switch writes no override', async () => {
++		const {app, umbreld} = await remoteApp(['test-app'])
++		await app.regenerateUserSettingsCompose()
++		await expect(fse.pathExists(app.userSettingsComposePath)).resolves.toBe(false)
++		await expect(readSavedRemoteAccessAnalysis(umbreld, 'test-app')).resolves.toMatchObject({disabled: true})
++	})
++})
++
+ describe('app storage source normalization', () => {
+ 	test.each([
+ 		['/Home/Shared ', '/Home/Shared '],
+diff --git a/packages/umbreld/source/modules/apps/app.ts b/packages/umbreld/source/modules/apps/app.ts
+index 17f8d09..e88579d 100644
+--- a/packages/umbreld/source/modules/apps/app.ts
++++ b/packages/umbreld/source/modules/apps/app.ts
+@@ -49,6 +49,8 @@ import {
+ import appScript from './legacy-compat/app-script.js'
+ import {readAppGatewayConfig} from '../app-gateway/app-gateway.js'
+ import {OWNER_USER_ID} from '../user/constants.js'
++import {remoteAccessEnvironment} from '../lan-ingress/remote-access.js'
++import {analyseInstalledApp, saveRemoteAccessAnalysis} from '../lan-ingress/remote-access-files.js'
+ 
+ async function readYaml(path: string) {
+ 	return yaml.load(await fse.readFile(path, 'utf8'))
+@@ -2010,7 +2012,9 @@ export default class App {
+ 			service.environment[variable.name] = variable.value
+ 		}
+ 
+-		if (Object.keys(userSettingsCompose.services).length === 0) {
++		const remoteEnvironment = await this.#remoteAccessEnvironment(compose)
++
++		if (Object.keys(userSettingsCompose.services).length === 0 && Object.keys(remoteEnvironment).length === 0) {
+ 			await fse.remove(this.userSettingsComposePath)
+ 			return
+ 		}
+@@ -2021,12 +2025,68 @@ export default class App {
+ 		// Escaping '$' to '$$' at serialization keeps every generated value literal.
+ 		escapeComposeInterpolation(userSettingsCompose)
+ 
++		// Remote access rewrites are merged after escaping: they are derived from
++		// the app's own compose values and keep their ${APP_*} references for
++		// Compose to interpolate. Values the user set above always win.
++		for (const [serviceName, environment] of Object.entries(remoteEnvironment)) {
++			const service = (userSettingsCompose.services[serviceName] ??= {})
++			service.environment ??= {}
++			for (const [name, value] of Object.entries(environment)) service.environment[name] ??= value
++		}
++
+ 		await fse.writeFile(
+ 			this.userSettingsComposePath,
+ 			`# Generated by Umbrel. Changes will be overwritten.\n${yaml.dump(userSettingsCompose)}`,
+ 		)
+ 	}
+ 
++	// Analyse which ports a browser uses (see lan-ingress/remote-access.ts),
++	// save the result, and return the env overrides for the remote domain.
++	// Never blocks an app from starting: on any error the app runs unchanged.
++	async #remoteAccessEnvironment(compose: Compose): Promise<Record<string, Record<string, string>>> {
++		try {
++			const lanIngress = this.#umbreld.lanIngress
++			const remote = lanIngress?.remoteDomain
++			const disabled = !!remote?.remoteAccessDisabledApps.includes(this.id)
++			const {analysis, exports, deviceHosts} = await analyseInstalledApp(this.#umbreld, {
++				appId: this.id,
++				appDataDirectory: this.dataDirectory,
++				compose,
++				lanHostname: lanIngress?.lanHostname ?? 'umbrel.local',
++				manifestAppAuthAllowed: !!remote?.allowUnauthenticatedApps.includes(this.id),
++			})
++			// Only app-gateway apps get remote hosts, so only they get rewrites.
++			const environment =
++				remote && !disabled && analysis.gateway
++					? remoteAccessEnvironment({remote, appId: this.id, analysis, compose, exports, deviceHosts})
++					: {}
++			const appliedEnvironment = Object.entries(environment).flatMap(([service, values]) =>
++				Object.keys(values).map((name) => ({service, name})),
++			)
++			const browserPorts = analysis.ports.filter((port) => port.role === 'browser').map((port) => port.port)
++			if (browserPorts.length || appliedEnvironment.length || analysis.declarationErrors.length) {
++				this.logger.log(
++					`Remote access for ${this.id} (${analysis.source}): browser ports [${browserPorts.join(', ')}], ` +
++						`env [${appliedEnvironment.map(({service, name}) => `${service}.${name}`).join(', ')}]` +
++						(disabled ? ', disabled by owner' : '') +
++						(remote ? '' : ', remote domain off') +
++						(analysis.declarationErrors.length ? `, declaration errors: ${analysis.declarationErrors.join('; ')}` : ''),
++				)
++			}
++			await saveRemoteAccessAnalysis(this.#umbreld, this.id, {
++				analysedAt: new Date().toISOString(),
++				remoteDomainActive: !!remote,
++				disabled,
++				appliedEnvironment,
++				analysis,
++			})
++			return environment
++		} catch (error) {
++			this.logger.error(`Remote access analysis failed for ${this.id}; starting without rewrites`, error)
++			return {}
++		}
++	}
++
+ 	// Drop and report saved storage settings that no longer apply after an app
+ 	// update. Keeping them hidden in settings would let a later app version
+ 	// silently reactivate an old folder permission.
+diff --git a/packages/umbreld/source/modules/auth/app-gateway-cookie.ts b/packages/umbreld/source/modules/auth/app-gateway-cookie.ts
+index 1f914d6..7bc2a98 100644
+--- a/packages/umbreld/source/modules/auth/app-gateway-cookie.ts
++++ b/packages/umbreld/source/modules/auth/app-gateway-cookie.ts
+@@ -4,10 +4,14 @@ import {BROWSER_SESSION_COOKIE_NAMES} from './browser-session-cookie.js'
+ 
+ export const APP_GATEWAY_HTTPS_COOKIE_NAME = '__Host-UMBREL_APP_SESSION_HTTPS'
+ export const APP_GATEWAY_HTTP_COOKIE_NAME = 'UMBREL_APP_SESSION'
++// Marks which extra remote port hosts already got a session (see
++// app-gateway/remote-ports.ts). Not a credential, but Umbrel-owned.
++export const REMOTE_HOSTS_COOKIE_NAME = '__Host-UMBREL_REMOTE_HOSTS'
+ 
+ const COOKIE_NAMES_BLOCKED_FROM_UPSTREAM = [
+ 	APP_GATEWAY_HTTPS_COOKIE_NAME,
+ 	APP_GATEWAY_HTTP_COOKIE_NAME,
++	REMOTE_HOSTS_COOKIE_NAME,
+ 	...BROWSER_SESSION_COOKIE_NAMES,
+ 	// Browsers may retain credentials issued by the removed app-proxy sidecar.
+ 	// They are never accepted, cleared, or migrated, but must still be stripped
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/docker-compose.yml
+new file mode 100644
+index 0000000..a855018
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/docker-compose.yml
+@@ -0,0 +1,23 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++services:
++  app_proxy:
++    environment:
++      APP_HOST: ekko-studio_server_1
++      APP_PORT: '6060'
++  server:
++    image: ekkoye8888/hermes-web-ui:v0.7.39@sha256:18e38249ec91bed1936323dffcb5f88a755d4654a3edbbc985d3535c575da58e
++    user: 1000:1000
++    init: true
++    restart: on-failure
++    environment:
++      PORT: '6060'
++      HOME: /home/agent
++      WORKSPACE_BASE: /opt/data
++      HERMES_HOME: /home/agent/.hermes
++      HERMES_BIN: /opt/hermes/.venv/bin/hermes
++      HERMES_WEB_UI_MANAGED_GATEWAY: '1'
++    volumes:
++    - ${APP_DATA_DIR}/data/home:/home/agent
++    - ${APP_DATA_DIR}/data/hermes:/home/agent/.hermes
++    - ${APP_DATA_DIR}/data/studio:/home/agent/.hermes-web-ui
++    - ${APP_DATA_DIR}/data/workspace:/opt/data
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/umbrel-app.yml
+new file mode 100644
+index 0000000..b202cbc
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ekko-studio/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1
++id: ekko-studio
++name: Ekko Studio
++version: 0.7.39
++port: 6063
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/docker-compose.yml
+new file mode 100644
+index 0000000..f31c35f
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/docker-compose.yml
+@@ -0,0 +1,76 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: librechat_api_1
++      APP_PORT: '3080'
++  api:
++    image: ghcr.io/danny-avila/librechat:v0.8.7@sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9
++    restart: on-failure
++    user: 1000:1000
++    command: npm run backend
++    env_file:
++    - path: ${APP_DATA_DIR}/.env
++    environment:
++    - HOST=0.0.0.0
++    - MONGO_URI=mongodb://librechat_mongodb_1:27017/LibreChat
++    - MEILI_HOST=http://librechat_meilisearch_1:7700
++    - RAG_PORT=8000
++    - RAG_API_URL=http://librechat_rag_api_1:8000
++    - OPENAI_API_KEY=fake-openai-api-key
++    - GOOGLE_KEY=fake-google-key
++    - ANTHROPIC_API_KEY=fake-anthropic-api-key
++    - ASSISTANTS_API_KEY=fake-assistants-api-key
++    - CREDS_KEY=fake-creds-key
++    - CREDS_IV=fake-creds-iv
++    - JWT_SECRET=fake-jwt-secret
++    - JWT_REFRESH_SECRET=fake-jwt-refresh-secret
++    volumes:
++    - ${APP_DATA_DIR}/data/api/librechat.yaml:/app/librechat.yaml
++    - ${APP_DATA_DIR}/data/api/images:/app/client/public/images
++    - ${APP_DATA_DIR}/data/api/uploads:/app/uploads
++    - ${APP_DATA_DIR}/data/api/logs:/app/api/logs
++    depends_on:
++    - mongodb
++    - rag_api
++  mongodb:
++    image: mongo:8.0.10@sha256:15fb53a5160ebabff5ecade8f8b5d48721b68ea190957a7f35b5b38e8340e62b
++    restart: on-failure
++    user: 1000:1000
++    volumes:
++    - ${APP_DATA_DIR}/data/db:/data/db
++    command: mongod --noauth
++  meilisearch:
++    image: getmeili/meilisearch:v1.12.3@sha256:4acfcbbb9e089aa1aac838cfda3fba7f07aaaef044c23da8acbe0ab741400dac
++    restart: on-failure
++    user: 1000:1000
++    environment:
++    - MEILI_HOST=http://librechat_meilisearch_1:7700
++    - MEILI_NO_ANALYTICS=true
++    - MEILI_MASTER_KEY=fake-meili-master-key
++    volumes:
++    - ${APP_DATA_DIR}/data/meilisearch:/meili_data
++  vectordb:
++    image: ankane/pgvector:v0.5.1@sha256:d3a9d8ac27bb7e05e333ef25b634d2625adaa85336ab729954b9e94859bf6fa7
++    environment:
++      POSTGRES_DB: mydatabase
++      POSTGRES_USER: myuser
++      POSTGRES_PASSWORD: fake-postgres-password
++    restart: on-failure
++    volumes:
++    - ${APP_DATA_DIR}/data/vectordb:/var/lib/postgresql/data
++  rag_api:
++    image: ghcr.io/danny-avila/librechat-rag-api-dev-lite:v0.7.3@sha256:67dba8e1e5707a795f2188d1e345f23b8ebf3bf75365026395edec76474cefa6
++    env_file:
++    - path: ${APP_DATA_DIR}/.env
++    environment:
++    - DB_HOST=librechat_vectordb_1
++    - RAG_PORT=8000
++    - OPENAI_API_KEY=fake-openai-api-key
++    - GOOGLE_KEY=fake-google-key
++    - ANTHROPIC_API_KEY=fake-anthropic-api-key
++    - ASSISTANTS_API_KEY=fake-assistants-api-key
++    restart: on-failure
++    depends_on:
++    - vectordb
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/umbrel-app.yml
+new file mode 100644
+index 0000000..0522864
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/librechat/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1.1
++id: librechat
++name: LibreChat
++version: 0.8.7
++port: 7050
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/docker-compose.yml
+new file mode 100644
+index 0000000..201cab9
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/docker-compose.yml
+@@ -0,0 +1,157 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: lobe-chat_app_1
++      APP_PORT: '3210'
++      PROXY_AUTH_ADD: 'false'
++  app:
++    image: lobehub/lobehub:2.2.21@sha256:01805eca5372cf4c99a7e895990596050959d68d890a3433015ced9fe538676e
++    restart: on-failure
++    env_file:
++    - ${APP_DATA_DIR}/settings.env
++    environment:
++      APP_URL: http://${DEVICE_DOMAIN_NAME}:7455
++      INTERNAL_APP_URL: http://lobe-chat_app_1:3210
++      AUTH_TRUSTED_ORIGINS: http://${DEVICE_DOMAIN_NAME}:7455
++      DATABASE_URL: postgresql://postgres:fake-password@lobe-chat_postgres_1:5432/lobehub
++      ES_REINDEX_STATE_DIR: /app/.elasticsearch-reindex
++      REDIS_URL: redis://lobe-chat_redis_1:6379
++      REDIS_PREFIX: lobechat
++      REDIS_TLS: '0'
++      S3_ENDPOINT: http://${DEVICE_DOMAIN_NAME}:7458
++      S3_INTERNAL_ENDPOINT: http://lobe-chat_rustfs_1:9000
++      S3_BUCKET: lobe
++      S3_ACCESS_KEY: fake-s3-access-key
++      S3_ENABLE_PATH_STYLE: '1'
++      S3_ACCESS_KEY_ID: fake-access-key-id
++      S3_SECRET_ACCESS_KEY: ${APP_PASSWORD}
++      S3_SET_ACL: '0'
++      LLM_VISION_IMAGE_USE_BASE64: '1'
++      SEARXNG_URL: http://lobe-chat_searxng_1:8080
++      ENABLE_AGENT_GATEWAY: '1'
++      AGENT_GATEWAY_URL: http://${DEVICE_DOMAIN_NAME}:7459
++      AGENT_GATEWAY_INTERNAL_URL: http://lobe-chat_gateway_1:8787
++      DEVICE_GATEWAY_URL: http://lobe-chat_gateway_1:8788
++    volumes:
++    - ${APP_DATA_DIR}/data/elasticsearch-reindex:/app/.elasticsearch-reindex
++    depends_on:
++      postgres-upgrade:
++        condition: service_completed_successfully
++      redis:
++        condition: service_healthy
++      rustfs:
++        condition: service_healthy
++      rustfs-init:
++        condition: service_completed_successfully
++      gateway:
++        condition: service_started
++  gateway:
++    image: ghcr.io/lobehub/lobehub-gateway:0.5.0@sha256:63647fd8f97407dafd344dd08b509ff74a033b23292cf1d451d804cb09d35759
++    restart: on-failure
++    env_file:
++    - ${APP_DATA_DIR}/gateway.env
++    ports:
++    - 7459:8787
++    - 7460:8788
++    environment:
++      LOBE_API_BASE_URL: http://lobe-chat_app_1:3210
++  postgres:
++    image: paradedb/paradedb:0.24.3-pg17@sha256:a784ffa6471729af6be5178ad39ea607e5cbfec94f81bcaad439de40ecb45834
++    user: 1000:1000
++    restart: on-failure
++    environment:
++      POSTGRES_DB: lobehub
++      POSTGRES_PASSWORD: fake-postgres-password
++    volumes:
++    - ${APP_DATA_DIR}/data/db:/var/lib/postgresql/data
++    healthcheck:
++      test:
++      - CMD-SHELL
++      - pg_isready -U postgres -d lobehub -h 127.0.0.1
++      interval: 10s
++      timeout: 5s
++      retries: 10
++      start_period: 60s
++  postgres-upgrade:
++    image: paradedb/paradedb:0.24.3-pg17@sha256:a784ffa6471729af6be5178ad39ea607e5cbfec94f81bcaad439de40ecb45834
++    user: 1000:1000
++    depends_on:
++      postgres:
++        condition: service_healthy
++    environment:
++      PGHOST: lobe-chat_postgres_1
++      PGUSER: postgres
++      PGPASSWORD: fake-pgpassword
++      PGCONNECT_TIMEOUT: '10'
++    entrypoint:
++    - /bin/sh
++    - -ec
++    command:
++    - "for database in template1 paradedb lobehub; do\n  psql --no-psqlrc --dbname=\"$${database}\" --set=ON_ERROR_STOP=1 --single-transaction --file=- <<'SQL'\nSELECT format('ALTER EXTENSION %I UPDATE;',\
++      \ name)\nFROM pg_available_extensions\nWHERE installed_version IS NOT NULL AND installed_version <> default_version\nORDER BY name\n\\gexec\nSQL\ndone\n"
++  redis:
++    image: redis:7.4.8@sha256:a5995dfdf108997f8a7c9587f54fad5e94ed5848de5236a6b28119e99efd67e0
++    user: 1000:1000
++    restart: on-failure
++    command: redis-server --save 60 1000 --appendonly yes
++    volumes:
++    - ${APP_DATA_DIR}/data/redis:/data
++    healthcheck:
++      test:
++      - CMD
++      - redis-cli
++      - ping
++      interval: 10s
++      timeout: 5s
++      retries: 10
++  rustfs:
++    image: rustfs/rustfs:1.0.0-alpha.90@sha256:0725587f6fcca83c1898f321424327d6e6da5e01ea20382905dd258ed5af3be4
++    restart: on-failure
++    ports:
++    - 7458:9000
++    volumes:
++    - ${APP_DATA_DIR}/data/rustfs:/data
++    - ${APP_DATA_DIR}/data/rustfs-logs:/logs
++    environment:
++      RUSTFS_ADDRESS: 0.0.0.0:9000
++      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
++      RUSTFS_CONSOLE_ENABLE: 'true'
++      RUSTFS_VOLUMES: /data
++      RUSTFS_ACCESS_KEY: fake-rustfs-access-key
++      RUSTFS_SECRET_KEY: ${APP_PASSWORD}
++      RUSTFS_OBS_LOG_DIRECTORY: /logs
++    healthcheck:
++      test:
++      - CMD
++      - sh
++      - -c
++      - curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health
++      interval: 30s
++      timeout: 10s
++      retries: 3
++      start_period: 40s
++  rustfs-init:
++    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
++    restart: on-failure
++    depends_on:
++      rustfs:
++        condition: service_healthy
++    volumes:
++    - ${APP_DATA_DIR}/bucket.config.json:/bucket.config.json:ro
++    entrypoint: /bin/sh
++    command:
++    - -c
++    - 'set -eu; rc --version; rc alias set rustfs "http://lobe-chat_rustfs_1:9000" "lobehub" "${APP_PASSWORD}"; rc ls rustfs || true; rc mb "rustfs/lobe" --ignore-existing; rc anonymous set-json "/bucket.config.json"
++      "rustfs/lobe"; printf "%s" "<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>3600</MaxAgeSeconds></CORSRule></CORSConfiguration>"
++      | rc bucket cors set "rustfs/lobe" -
++
++      '
++  searxng:
++    image: ghcr.io/searxng/searxng:2026.4.22-74f1ca203@sha256:37c616a774b90fb5df9239eb143f1b11866ddf7b830cd1ebcca6ba11b38cc2bf
++    restart: on-failure
++    environment:
++      SEARXNG_SECRET: ${APP_SEED}
++    volumes:
++    - ${APP_DATA_DIR}/data/searxng/settings.yml:/etc/searxng/settings.yml
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/umbrel-app.yml
+new file mode 100644
+index 0000000..722fb04
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/lobe-chat/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1.1
++id: lobe-chat
++name: Lobe Hub
++version: 2.2.21
++port: 7455
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/docker-compose.yml
+new file mode 100644
+index 0000000..ba0c7c2
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/docker-compose.yml
+@@ -0,0 +1,39 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: murmur_web_1
++      APP_PORT: '3000'
++      PROXY_AUTH_WHITELIST: /manifest.webmanifest,/favicon.svg,/icon.svg,/icon-192.png,/icon-512.png,/icon-maskable-512.png,/apple-touch-icon.png
++  web:
++    image: ghcr.io/getumbrel/murmur:v0.9.0@sha256:4137c76a7636c3bd7fd963bf8a98d5a302fba728e0fac0de14681124f6a875a4
++    user: 1000:1000
++    init: true
++    restart: on-failure
++    volumes:
++    - ${APP_DATA_DIR}/data/murmur:/data
++    environment:
++      MURMUR_BUILTIN_HERMES_URL: http://murmur_hermes_1:9119
++      MURMUR_BUILTIN_HERMES_USERNAME: murmur
++      MURMUR_BUILTIN_HERMES_PASSWORD: ${APP_MURMUR_HERMES_PASSWORD}
++      MURMUR_FIND_HERMES: Hermes Agent=http://hermes-agent_web_1:18789
++      MURMUR_ALLOWED_HOSTS: '*'
++  hermes:
++    image: ghcr.io/getumbrel/hermes-agent-umbrel:v0.22.5-1@sha256:56a113bf566852b75e739ac978b874ffc45d0973d56c21b1ab94b6cac2538fe9
++    restart: on-failure
++    stop_grace_period: 1m
++    volumes:
++    - ${APP_DATA_DIR}/data/hermes:/opt/data
++    environment:
++      HERMES_UID: '1000'
++      HERMES_GID: '1000'
++      HERMES_DASHBOARD: '1'
++      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: murmur
++      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${APP_MURMUR_HERMES_PASSWORD}
++      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${APP_MURMUR_HERMES_SECRET}
++      HERMES_GATEWAY_BOOTSTRAP_STATE: running
++      UMBREL_APP_NAME: Murmur
++    command:
++    - gateway
++    - run
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/exports.sh b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/exports.sh
+new file mode 100644
+index 0000000..12a4559
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/exports.sh
+@@ -0,0 +1,3 @@
++# Test fixture: fake values
++export APP_MURMUR_HERMES_PASSWORD="fake-password"
++export APP_MURMUR_HERMES_SECRET="fake-secret"
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/umbrel-app.yml
+new file mode 100644
+index 0000000..ef03b03
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/murmur/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1.1
++id: murmur
++name: Murmur
++version: 0.9.0
++port: 18793
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/docker-compose.yml
+new file mode 100644
+index 0000000..b0af64d
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/docker-compose.yml
+@@ -0,0 +1,18 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: ollama_ollama_1
++      APP_PORT: '11434'
++      PROXY_AUTH_ADD: 'false'
++  ollama:
++    image: ollama/ollama:0.40.13@sha256:b2f0122c476bc9fe7ce679d8bb4bd555351e25e2554eefb156f61cb0a89cf429
++    environment:
++      OLLAMA_ORIGINS: '*'
++      OLLAMA_CONTEXT_LENGTH: '8192'
++      OLLAMA_VULKAN: '1'
++      OLLAMA_IGPU_ENABLE: '1'
++    volumes:
++    - ${APP_DATA_DIR}/data:/root/.ollama
++    restart: on-failure
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/exports.sh b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/exports.sh
+new file mode 100644
+index 0000000..331231f
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/exports.sh
+@@ -0,0 +1,2 @@
++# Test fixture
++export APP_OLLAMA_URL="http://ollama_ollama_1:11434"
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/umbrel-app.yml
+new file mode 100644
+index 0000000..7a78468
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/ollama/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1
++id: ollama
++name: Ollama
++version: 0.40.13
++port: 11434
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/docker-compose.yml
+new file mode 100644
+index 0000000..621f2f7
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/docker-compose.yml
+@@ -0,0 +1,18 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: openclaw_gateway_1
++      APP_PORT: '18789'
++  gateway:
++    image: ghcr.io/getumbrel/openclaw-umbrel:2026.9.34@sha256:738340444a4d1c05ea79175f56a2c0b5607a316a6dc8ea9fd5c8dd36d734534a
++    user: 1000:1000
++    init: true
++    restart: on-failure
++    stop_grace_period: 1m
++    volumes:
++    - ${APP_DATA_DIR}/data:/data
++    - ${APP_DATA_DIR}/data/linuxbrew:/home/linuxbrew
++    environment:
++      APP_SEED: ${APP_SEED}
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/umbrel-app.yml
+new file mode 100644
+index 0000000..d2e2cab
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/openclaw/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1.1
++id: openclaw
++name: OpenClaw
++version: 2026.9.34
++port: 18789
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/docker-compose.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/docker-compose.yml
+new file mode 100644
+index 0000000..fdc6230
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/docker-compose.yml
+@@ -0,0 +1,22 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++version: '3.7'
++services:
++  app_proxy:
++    environment:
++      APP_HOST: stirling-pdf_app_1
++      APP_PORT: '8080'
++      PROXY_AUTH_WHITELIST: /api/*
++  app:
++    image: stirlingtools/stirling-pdf:3.2.2@sha256:c6872dd056b0046a14c5de1e9970283e7f1e1ff685bb08090c6b37a231127d31
++    restart: on-failure
++    stop_grace_period: 1m
++    volumes:
++    - ${APP_DATA_DIR}/data/tessdata:/usr/share/tessdata
++    - ${APP_DATA_DIR}/data/configs:/configs
++    - ${APP_DATA_DIR}/data/logs:/logs
++    - ${APP_DATA_DIR}/data/pipeline:/pipeline
++    environment:
++      DOCKER_ENABLE_SECURITY: 'false'
++      INSTALL_BOOK_AND_ADVANCED_HTML_OPS: 'true'
++      LANGS: ALL
++      SECURITY_ENABLELOGIN: 'false'
+diff --git a/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/umbrel-app.yml b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/umbrel-app.yml
+new file mode 100644
+index 0000000..699d729
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/fixtures/remote-access/stirling-pdf/umbrel-app.yml
+@@ -0,0 +1,7 @@
++# Test fixture: getumbrel/umbrel-apps template with fake values for secrets.
++manifestVersion: 1
++id: stirling-pdf
++name: Stirling PDF
++version: 3.2.2
++port: 27829
++path: ''
+diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
+index 3d08a1d..5f0badf 100644
+--- a/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
++++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress-remote-lifecycle.unit.test.ts
+@@ -1,10 +1,14 @@
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
+ import Emittery from 'emittery'
+ import {afterEach, describe, expect, test, vi} from 'vitest'
+ 
+ const {execaDollar} = vi.hoisted(() => ({execaDollar: vi.fn(() => vi.fn(async () => ({exitCode: 0, stdout: ''})))}))
+ vi.mock('execa', () => ({$: execaDollar}))
+ 
+-import LanIngress from './lan-ingress.js'
++import LanIngress, {REMOTE_REJECT_HEADER} from './lan-ingress.js'
+ import type {RemoteDomainSettings} from './remote-domain.js'
+ 
+ type Internals = {
+@@ -12,6 +16,9 @@ type Internals = {
+ 	remoteAppAuth(appId: string): boolean | undefined
+ 	updateRemoteAppHosts(): void
+ 	remoteDispatchFor(host: string, protocol: 'https'): unknown
++	setRemotePortTargets(targets: Map<string, unknown[]>): void
++	handleRemoteRequest(request: unknown, response: unknown, protocol: 'https', upstreamPort: number): boolean
++	getRemotePortTargets(appId: string, compose: unknown): Promise<unknown[]>
+ }
+ 
+ // Remote routing has to follow app installs, updates, restarts and uninstalls
+@@ -23,7 +30,7 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
+ 		await Promise.all(ingresses.splice(0).map((ingress) => ingress.stop()))
+ 	})
+ 
+-	function createIngress(settings: RemoteDomainSettings | undefined) {
++	function createIngress(settings: RemoteDomainSettings | undefined, dataDirectory = '/tmp') {
+ 		const logger = {createChildLogger: () => logger, log: vi.fn(), error: vi.fn(), verbose: vi.fn()}
+ 		const emitter = new Emittery()
+ 		const emitted: string[] = []
+@@ -34,7 +41,7 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
+ 			}),
+ 		}
+ 		const store = {get: vi.fn(async () => settings)}
+-		const ingress = new LanIngress({dataDirectory: '/tmp', port: 80, logger, eventBus, store} as never)
++		const ingress = new LanIngress({dataDirectory, port: 80, logger, eventBus, store} as never)
+ 		ingresses.push(ingress)
+ 		let gatewayApps = ['nextcloud']
+ 		const internals = ingress as unknown as Internals
+@@ -124,4 +131,127 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
+ 		})
+ 		expect(emitted).toEqual(['lan-ingress:remote-routes:change'])
+ 	})
++
++	const portTarget = (port: number, auth: 'umbrel' | 'app' = 'umbrel') => ({
++		port,
++		service: 'rustfs',
++		containerPort: 9000,
++		targetHost: 'nextcloud_rustfs_1',
++		targetAddress: '10.21.0.9',
++		auth,
++	})
++
++	test('routes extra port hosts to the app and drops them with the app', async () => {
++		const {ingress, internals, emitted, setGatewayApps} = createIngress(enabled)
++		await start(ingress)
++		emitted.length = 0
++		internals.setRemotePortTargets(new Map([['nextcloud', [portTarget(7458), portTarget(7459, 'app')]]]))
++		internals.updateRemoteAppHosts()
++		expect(internals.remoteDispatchFor('nextcloud-7458-umbrel.example.com', 'https')).toMatchObject({
++			type: 'app',
++			appId: 'nextcloud',
++		})
++		expect(ingress.remotePortRoutes('nextcloud').map((route) => route.host)).toEqual([
++			'nextcloud-7458-umbrel.example.com',
++			'nextcloud-7459-umbrel.example.com',
++		])
++		// The login handoff may only target port hosts that use Umbrel login.
++		expect(ingress.remoteAppPortOrigin('nextcloud', 7458)).toBe('https://nextcloud-7458-umbrel.example.com')
++		expect(ingress.remoteAppPortOrigin('nextcloud', 7459)).toBeUndefined()
++		expect(ingress.remoteAppPortOrigin('nextcloud', 1234)).toBeUndefined()
++		expect(emitted).toEqual(['lan-ingress:remote-routes:change'])
++
++		setGatewayApps([])
++		internals.updateRemoteAppHosts()
++		expect(ingress.remotePortRoutes('nextcloud')).toEqual([])
++		expect(internals.remoteDispatchFor('nextcloud-7458-umbrel.example.com', 'https')).toMatchObject({type: 'reject'})
++	})
++
++	test('the per-app switch removes port hosts but keeps the main host', async () => {
++		const {ingress, internals} = createIngress({...enabled, remoteAccessDisabledApps: ['nextcloud']})
++		await start(ingress)
++		internals.setRemotePortTargets(new Map([['nextcloud', [portTarget(7458)]]]))
++		internals.updateRemoteAppHosts()
++		expect(ingress.remoteAppOrigin('nextcloud')).toBe('https://nextcloud-umbrel.example.com')
++		expect(ingress.remotePortRoutes('nextcloud')).toEqual([])
++		expect(internals.remoteDispatchFor('nextcloud-7458-umbrel.example.com', 'https')).toMatchObject({type: 'reject'})
++	})
++
++	test('a port host that equals another app id is not routed', async () => {
++		const {ingress, internals, setGatewayApps} = createIngress(enabled)
++		await start(ingress)
++		setGatewayApps(['nextcloud', 'nextcloud-7458'])
++		internals.setRemotePortTargets(new Map([['nextcloud', [portTarget(7458)]]]))
++		internals.updateRemoteAppHosts()
++		expect(internals.remoteDispatchFor('nextcloud-7458-umbrel.example.com', 'https')).toMatchObject({
++			type: 'app',
++			appId: 'nextcloud-7458',
++		})
++		expect(ingress.remotePortRoutes('nextcloud')).toEqual([])
++	})
++	// The e2e harness needs to tell "this host is not routed" from "the app
++	// answered 404 on this path".
++	test("Umbrel's own 404 for an unknown remote host carries a marker", async () => {
++		const {ingress, internals} = createIngress(enabled)
++		await start(ingress)
++		internals.updateRemoteAppHosts()
++		const written: {status?: number; headers?: Record<string, string>} = {}
++		const response = {
++			writeHead: (status: number, headers: Record<string, string>) => Object.assign(written, {status, headers}),
++			end: vi.fn(),
++		}
++		const handled = internals.handleRemoteRequest(
++			{headers: {host: 'unknown-umbrel.example.com'}},
++			response,
++			'https',
++			80,
++		)
++		expect(handled).toBe(true)
++		expect(written.status).toBe(404)
++		expect(written.headers?.[REMOTE_REJECT_HEADER]).toBe('rejected')
++	})
++
++	// The gateway passes remote requests through unchanged only for apps that
++	// were started with their base URL on the remote origin.
++	test('follows the saved analysis of what the app was started with', async () => {
++		const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-origin-'))
++		try {
++			const {ingress, internals} = createIngress(enabled, dataDirectory)
++			await start(ingress)
++			const analysisDirectory = path.join(dataDirectory, 'remote-access', 'analysis')
++			fs.mkdirSync(analysisDirectory, {recursive: true})
++			const save = (applied: Array<{service: string; name: string}>) =>
++				fs.writeFileSync(
++					path.join(analysisDirectory, 'nextcloud.json'),
++					JSON.stringify({
++						analysedAt: '2026-01-01T00:00:00.000Z',
++						remoteDomainActive: true,
++						disabled: false,
++						appliedEnvironment: applied,
++						analysis: {
++							version: 1,
++							appId: 'nextcloud',
++							source: 'heuristic',
++							enabled: true,
++							mainPort: 7455,
++							gateway: null,
++							ports: [],
++							env: [{service: 'app', name: 'APP_URL', kind: 'base-url', reason: ''}],
++							warnings: [],
++							declarationErrors: [],
++						},
++					}),
++				)
++			const compose = {services: {}}
++			save([{service: 'app', name: 'APP_URL'}])
++			await internals.getRemotePortTargets('nextcloud', compose)
++			expect(ingress.usesRemoteOrigin('nextcloud')).toBe(true)
++			save([])
++			await internals.getRemotePortTargets('nextcloud', compose)
++			expect(ingress.usesRemoteOrigin('nextcloud')).toBe(false)
++			expect(ingress.usesRemoteOrigin('agent-zero')).toBe(false)
++		} finally {
++			fs.rmSync(dataDirectory, {recursive: true, force: true})
++		}
++	})
+ })
+diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
+index 38fd88e..ecefdeb 100644
+--- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
++++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
+@@ -19,7 +19,10 @@ import {forwardTcp} from './forward-tcp.js'
+ import {readNativeTlsPrelude} from './native-tls-preread.js'
+ import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
+ import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
++import {analyseInstalledApp, readSavedRemoteAccessAnalysis, savedUsesRemoteOrigin} from './remote-access-files.js'
++import {remoteAccessPorts, type RemoteAccessAnalysis, type RemoteAccessAuth} from './remote-access.js'
+ import {
++	appPortRemoteHost,
+ 	appRemoteHost,
+ 	buildAppHostMap,
+ 	lanAppOrigin,
+@@ -84,6 +87,27 @@ export type RemoteDispatch =
+ 	| {type: 'app'; appId: string}
+ 	| {type: 'reject'; status: number; message: string}
+ 
++// An extra browser-facing port of an app, resolved to its container.
++type RemotePortTarget = {
++	port: number
++	service: string
++	containerPort: number
++	targetHost: string
++	targetAddress: string
++	auth: RemoteAccessAuth
++}
++
++// What the app gateway needs to serve one extra port host.
++export type RemotePortRoute = RemotePortTarget & {host: string; origin: string; lanOrigin: string}
++
++export type RemoteAccessStatus = {
++	disabled: boolean
++	source: RemoteAccessAnalysis['source'] | null
++	hosts: Array<{port: number; origin: string; auth: RemoteAccessAuth; routed: boolean}>
++	warnings: string[]
++	declarationErrors: string[]
++}
++
+ export type RemoteAppStatus = {
+ 	appId: string
+ 	origin: string
+@@ -94,8 +118,15 @@ export type RemoteAppStatus = {
+ 	// remote domain they need the owner's per-app opt-in.
+ 	publicPaths: string[]
+ 	publicPathsAllowed: boolean
++	remoteAccess: RemoteAccessStatus
+ }
+ 
++// Marks responses Umbrel writes itself on the remote domain (unknown host,
++// app starting, HTTP refused, app blocked), so a client or test can tell
++// Umbrel's own 404 apart from a 404 the app sent.
++export const REMOTE_REJECT_HEADER = 'x-umbrel-remote'
++export const REMOTE_REJECT_VALUE = 'rejected'
++
+ // Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
+ // - Hosts outside the remote domain (IP, LAN, mDNS, Tailscale) and the dashboard
+ //   host keep today's behaviour.
+@@ -226,6 +257,14 @@ export default class LanIngress {
+ 	// umbrel.yaml (FileStore re-reads the file on every get).
+ 	#remoteDomain?: RemoteDomain
+ 	#remoteAppHosts = new Map<string, string>()
++	// Extra port hosts (remote access analysis): host -> {appId, port}. Kept
++	// apart from #remoteAppHosts so status and app links stay main-host only.
++	#remotePortHosts = new Map<string, {appId: string; port: number}>()
++	#remotePortTargets = new Map<string, RemotePortTarget[]>()
++	#remoteAccessAnalyses = new Map<string, RemoteAccessAnalysis>()
++	// Apps started with their base URL on their remote origin; their gateway
++	// passes remote requests through instead of presenting them as LAN ones.
++	#remoteOriginApps = new Set<string>()
+ 	#remoteAuthProxy?: RequestHandler
+ 	#remoteRoutesSignature = ''
+ 	// The mDNS name apps are told about (DEVICE_DOMAIN_NAME), used as the LAN
+@@ -691,9 +730,11 @@ export default class LanIngress {
+ 							this.logger.verbose(`Skipping LAN ingress route for ${appId}; app gateway target is unavailable`)
+ 							return {reservedPorts, route: null}
+ 						}
++						const remotePorts = await this.getRemotePortTargets(appId, compose)
+ 						return {
+ 							reservedPorts,
+ 							route: {id: appId, publicPort, gateway: {...gateway, targetAddress}},
++							remotePorts,
+ 						}
+ 					}
+ 
+@@ -716,6 +757,19 @@ export default class LanIngress {
+ 				}
+ 			}),
+ 		)
++		this.setRemotePortTargets(
++			new Map(
++				results.flatMap((result) =>
++					result?.route && 'remotePorts' in result && result.remotePorts ? [[result.route.id, result.remotePorts]] : [],
++				),
++			),
++		)
++		for (const appId of this.#remoteAccessAnalyses.keys()) {
++			if (!gatewayIds.has(appId)) this.#remoteAccessAnalyses.delete(appId)
++		}
++		for (const appId of this.#remoteOriginApps) {
++			if (!gatewayIds.has(appId)) this.#remoteOriginApps.delete(appId)
++		}
+ 		for (const [appId, wait] of this.#appGatewayWaits) {
+ 			if (gatewayIds.has(appId)) continue
+ 			wait.controller.abort()
+@@ -744,6 +798,52 @@ export default class LanIngress {
+ 		return [...mappingsByHiddenPort.values()]
+ 	}
+ 
++	// Analyse the app (see remote-access.ts) and resolve each browser-facing
++	// extra port to its container on umbrel_main_network. Only while remote
++	// mode is on; a port whose container is not up yet is skipped until the
++	// next refresh.
++	private async getRemotePortTargets(appId: string, compose: ComposeFile | null): Promise<RemotePortTarget[]> {
++		const remote = this.#remoteDomain
++		if (!remote || !compose) {
++			this.#remoteAccessAnalyses.delete(appId)
++			this.#remoteOriginApps.delete(appId)
++			return []
++		}
++		try {
++			const saved = await readSavedRemoteAccessAnalysis(this.#umbreld, appId)
++			if (savedUsesRemoteOrigin(saved)) this.#remoteOriginApps.add(appId)
++			else this.#remoteOriginApps.delete(appId)
++			const {analysis} = await analyseInstalledApp(this.#umbreld, {
++				appId,
++				appDataDirectory: `${this.#umbreld.dataDirectory}/app-data/${appId}`,
++				compose,
++				lanHostname: this.#lanHostname,
++				manifestAppAuthAllowed: remote.allowUnauthenticatedApps.includes(appId),
++			})
++			this.#remoteAccessAnalyses.set(appId, analysis)
++			const targets: RemotePortTarget[] = []
++			for (const port of remoteAccessPorts(analysis)) {
++				const service = compose.services?.[port.service]
++				const targetHost =
++					typeof service?.container_name === 'string' ? service.container_name : `${appId}_${port.service}_1`
++				const targetAddress = await this.resolveAppTarget(appId, targetHost, compose)
++				if (!targetAddress) continue
++				targets.push({
++					port: port.port,
++					service: port.service,
++					containerPort: port.containerPort,
++					targetHost,
++					targetAddress,
++					auth: port.auth,
++				})
++			}
++			return targets
++		} catch (error) {
++			this.logger.error(`Remote access analysis failed for ${appId}`, error)
++			return []
++		}
++	}
++
+ 	private canRouteAppDirectly(compose: ComposeFile | null, publicPort: number, publishedPorts: number[]) {
+ 		if (!compose?.services) return false
+ 		// Some apps publish their UI port directly without app_proxy.
+@@ -974,14 +1074,111 @@ export default class LanIngress {
+ 	// Only apps behind the app gateway get a remote host. Directly routed and
+ 	// non-HTTP apps stay on LAN/Tailscale ports.
+ 	private updateRemoteAppHosts() {
+-		if (!this.#remoteDomain) {
++		const remote = this.#remoteDomain
++		if (!remote) {
+ 			this.#remoteAppHosts = new Map()
++			this.#remotePortHosts = new Map()
+ 		} else {
+-			this.#remoteAppHosts = buildAppHostMap(this.#remoteDomain, this.remoteGatewayAppIds())
++			this.#remoteAppHosts = buildAppHostMap(remote, this.remoteGatewayAppIds())
++			const portHosts = new Map<string, {appId: string; port: number}>()
++			const collisions = new Set<string>()
++			for (const appId of this.#remoteAppHosts.values()) {
++				if (remote.remoteAccessDisabledApps.includes(appId)) continue
++				for (const target of this.#remotePortTargets.get(appId) ?? []) {
++					const host = appPortRemoteHost(remote, appId, target.port)
++					if (!host) continue
++					// A real app id always wins over another app's port host.
++					if (this.#remoteAppHosts.has(host) || (portHosts.has(host) && portHosts.get(host)!.appId !== appId)) {
++						collisions.add(host)
++					}
++					portHosts.set(host, {appId, port: target.port})
++				}
++			}
++			for (const host of collisions) {
++				portHosts.delete(host)
++				this.logger.error(`Remote access host ${host} collides with another app host; not routed`)
++			}
++			this.#remotePortHosts = portHosts
+ 		}
+ 		this.emitRemoteRoutesChangeIfNeeded()
+ 	}
+ 
++	// Takes effect on the next updateRemoteAppHosts().
++	private setRemotePortTargets(targets: Map<string, RemotePortTarget[]>) {
++		this.#remotePortTargets = targets
++	}
++
++	get lanHostname() {
++		return this.#lanHostname
++	}
++
++	// Extra port hosts of an app that are routed right now, for its gateway.
++	remotePortRoutes(appId: string): RemotePortRoute[] {
++		const remote = this.#remoteDomain
++		if (!remote || remote.remoteAccessDisabledApps.includes(appId)) return []
++		return (this.#remotePortTargets.get(appId) ?? []).flatMap((target) => {
++			const host = appPortRemoteHost(remote, appId, target.port)
++			if (!host || this.#remotePortHosts.get(host)?.appId !== appId) return []
++			return [{...target, host, origin: `https://${host}`, lanOrigin: lanAppOrigin(this.#lanHostname, target.port)}]
++		})
++	}
++
++	// The origin of an app's extra port host that uses Umbrel login, for the
++	// remote login handoff. Undefined unless the main host is routed too.
++	remoteAppPortOrigin(appId: string, port: number) {
++		if (!this.remoteAppOrigin(appId)) return
++		const route = this.remotePortRoutes(appId).find((candidate) => candidate.port === port)
++		return route?.auth === 'umbrel' ? route.origin : undefined
++	}
++
++	// Whether the app was started with its base URL on its remote origin, so
++	// its gateway passes remote requests through unchanged (see AppGateway).
++	usesRemoteOrigin(appId: string) {
++		return this.#remoteOriginApps.has(appId)
++	}
++
++	// The live analysis for the owner's settings UI. No env values.
++	remoteAccessAnalysis(appId: string) {
++		return this.#remoteAccessAnalyses.get(appId) ?? null
++	}
++
++	private remoteAccessStatus(appId: string): RemoteAccessStatus {
++		const remote = this.#remoteDomain
++		const analysis = this.#remoteAccessAnalyses.get(appId)
++		const routes = this.remotePortRoutes(appId)
++		const ports = analysis ? remoteAccessPorts(analysis) : []
++		return {
++			disabled: !!remote?.remoteAccessDisabledApps.includes(appId),
++			source: analysis?.source ?? null,
++			hosts: remote
++				? ports.flatMap((port) => {
++						const host = appPortRemoteHost(remote, appId, port.port)
++						return host
++							? [
++									{
++										port: port.port,
++										origin: `https://${host}`,
++										auth: port.auth,
++										routed: routes.some((route) => route.port === port.port),
++									},
++								]
++							: []
++					})
++				: [],
++			warnings: analysis?.warnings ?? [],
++			declarationErrors: analysis?.declarationErrors ?? [],
++		}
++	}
++
++	// Main app hosts plus extra port hosts, for dispatch only.
++	private remoteDispatchHosts() {
++		if (!this.#remotePortHosts.size) return this.#remoteAppHosts
++		const hosts = new Map<string, string>()
++		for (const [host, {appId}] of this.#remotePortHosts) hosts.set(host, appId)
++		for (const [host, appId] of this.#remoteAppHosts) hosts.set(host, appId)
++		return hosts
++	}
++
+ 	// apps.list carries each app's remote URL, and gateway routes appear only
+ 	// after the app's container accepts connections, which is after the app's
+ 	// state already changed. Tell clients when the routed set really changes.
+@@ -989,6 +1186,7 @@ export default class LanIngress {
+ 		const signature = JSON.stringify({
+ 			remote: this.#remoteDomain ?? null,
+ 			apps: this.remoteAppStatus(),
++			portHosts: [...this.#remotePortHosts.keys()].sort(),
+ 		})
+ 		if (signature === this.#remoteRoutesSignature) return
+ 		const isFirst = this.#remoteRoutesSignature === ''
+@@ -1037,6 +1235,7 @@ export default class LanIngress {
+ 					reachable: authEnabled || allowed,
+ 					publicPaths,
+ 					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
++					remoteAccess: this.remoteAccessStatus(appId),
+ 				}
+ 			})
+ 			.sort((a, b) => a.appId.localeCompare(b.appId))
+@@ -1062,7 +1261,7 @@ export default class LanIngress {
+ 	private remoteDispatchFor(host: string | undefined, protocol: 'http' | 'https') {
+ 		return remoteDispatch({
+ 			remote: this.#remoteDomain,
+-			appHosts: this.#remoteAppHosts,
++			appHosts: this.remoteDispatchHosts(),
+ 			appAuth: (id) => this.remoteAppAuth(id),
+ 			host,
+ 			protocol,
+@@ -1105,6 +1304,7 @@ export default class LanIngress {
+ 				'content-type': 'text/plain; charset=utf-8',
+ 				'cache-control': 'no-store',
+ 				'x-content-type-options': 'nosniff',
++				[REMOTE_REJECT_HEADER]: REMOTE_REJECT_VALUE,
+ 				// A starting app retries on its own once its route is ready.
+ 				...(dispatch.status === 503 ? {'retry-after': '5', refresh: '5'} : {}),
+ 			})
+@@ -1113,7 +1313,12 @@ export default class LanIngress {
+ 		}
+ 		const handler = this.remoteHandler(dispatch)
+ 		if (!handler) {
+-			response.writeHead(404, {'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store'})
++			response.writeHead(404, {
++				'content-type': 'text/plain; charset=utf-8',
++				'cache-control': 'no-store',
++				'x-content-type-options': 'nosniff',
++				[REMOTE_REJECT_HEADER]: REMOTE_REJECT_VALUE,
++			})
+ 			response.end('Not Found\n')
+ 			return true
+ 		}
+@@ -1135,7 +1340,9 @@ export default class LanIngress {
+ 		const handler = dispatch.type === 'reject' ? undefined : this.remoteHandler(dispatch)
+ 		if (!handler?.upgrade) {
+ 			const status = dispatch.type === 'reject' ? dispatch.status : 404
+-			socket.write(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\n\r\n`)
++			socket.write(
++				`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\n${REMOTE_REJECT_HEADER}: ${REMOTE_REJECT_VALUE}\r\nConnection: close\r\n\r\n`,
++			)
+ 			socket.destroy()
+ 			return true
+ 		}
+@@ -1227,6 +1434,8 @@ export default class LanIngress {
+ 					onUpstreamUnavailable: () => void this.requestAppTargetRecovery(route.gateway!),
+ 					getRemoteDomain: () => this.#remoteDomain,
+ 					getLanOrigin: () => lanAppOrigin(this.#lanHostname, route.publicPort),
++					getUsesRemoteOrigin: () => this.usesRemoteOrigin(route.id),
++					getRemotePorts: () => this.remotePortRoutes(route.id),
+ 				}).server
+ 				await this.listen(gatewayServer, 0, '127.0.0.1')
+ 				upstreamPort = this.serverPort(gatewayServer)
+diff --git a/packages/umbreld/source/modules/lan-ingress/remote-access-files.ts b/packages/umbreld/source/modules/lan-ingress/remote-access-files.ts
+new file mode 100644
+index 0000000..65db301
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/remote-access-files.ts
+@@ -0,0 +1,140 @@
++import fse from 'fs-extra'
++import yaml from 'js-yaml'
++
++import type Umbreld from '../../index.js'
++import {getHostname, getIpAddresses} from '../system/system.js'
++import {analyseRemoteAccess, parseStaticExports, type RemoteAccessAnalysis} from './remote-access.js'
++
++// Disk side of the remote access analysis: the owner's local override, the
++// app's static exports, device names, and the saved result.
++//
++//   <umbreld data>/remote-access/<appId>.yml            owner's override (remoteAccess block)
++//   <umbreld data>/remote-access/analysis/<appId>.json  last analysis + applied env names
++
++export function remoteAccessDirectory(umbreld: Pick<Umbreld, 'dataDirectory'>) {
++	return `${umbreld.dataDirectory}/remote-access`
++}
++
++function validAppId(appId: string) {
++	return /^[a-zA-Z0-9-]+$/.test(appId)
++}
++
++export async function readRemoteAccessOverride(umbreld: Pick<Umbreld, 'dataDirectory'>, appId: string) {
++	if (!validAppId(appId)) return {value: undefined, error: undefined}
++	const path = `${remoteAccessDirectory(umbreld)}/${appId}.yml`
++	const contents = await fse.readFile(path, 'utf8').catch(() => undefined)
++	if (contents === undefined) return {value: undefined, error: undefined}
++	try {
++		const parsed = yaml.load(contents) as {remoteAccess?: unknown} | null
++		// Accept the block either at the top level or under `remoteAccess:`.
++		const value = parsed && typeof parsed === 'object' && 'remoteAccess' in parsed ? parsed.remoteAccess : parsed
++		return {value: value ?? undefined, error: undefined}
++	} catch {
++		return {value: undefined, error: `local override ${appId}.yml is not valid YAML`}
++	}
++}
++
++export async function readStaticAppExports(appDataDirectory: string) {
++	const contents = await fse.readFile(`${appDataDirectory}/exports.sh`, 'utf8').catch(() => '')
++	return parseStaticExports(contents)
++}
++
++export async function deviceHosts(lanHostname: string) {
++	const hosts = new Set([lanHostname, lanHostname.replace(/\.local$/, '')])
++	const hostname = await getHostname().catch(() => '')
++	if (hostname) {
++		hosts.add(hostname)
++		hosts.add(`${hostname}.local`)
++	}
++	// getIpAddresses() is async in the Docker build (patch 0003) and sync upstream.
++	const ips = await Promise.resolve()
++		.then(() => getIpAddresses())
++		.catch(() => [] as string[])
++	for (const ip of ips) hosts.add(ip)
++	return [...hosts].filter(Boolean).map((host) => host.toLowerCase())
++}
++
++export async function analyseInstalledApp(
++	umbreld: Pick<Umbreld, 'dataDirectory'>,
++	{
++		appId,
++		appDataDirectory,
++		compose,
++		lanHostname,
++		manifestAppAuthAllowed,
++	}: {
++		appId: string
++		appDataDirectory: string
++		compose: unknown
++		lanHostname: string
++		manifestAppAuthAllowed: boolean
++	},
++) {
++	const [manifestText, exports, override, hosts] = await Promise.all([
++		fse.readFile(`${appDataDirectory}/umbrel-app.yml`, 'utf8').catch(() => ''),
++		readStaticAppExports(appDataDirectory),
++		readRemoteAccessOverride(umbreld, appId),
++		deviceHosts(lanHostname),
++	])
++	let manifest: {port?: unknown; remoteAccess?: unknown} | null = null
++	try {
++		manifest = (yaml.load(manifestText) as typeof manifest) ?? null
++	} catch {}
++	const analysis = analyseRemoteAccess({
++		appId,
++		manifest,
++		compose,
++		exports,
++		deviceHosts: hosts,
++		localOverride: override.value,
++		manifestAppAuthAllowed,
++	})
++	if (override.error) analysis.declarationErrors.unshift(override.error)
++	return {analysis, exports, deviceHosts: hosts}
++}
++
++export type SavedRemoteAccess = {
++	analysedAt: string
++	remoteDomainActive: boolean
++	disabled: boolean
++	// Variable names (never values) written to the user-settings override.
++	appliedEnvironment: Array<{service: string; name: string}>
++	analysis: RemoteAccessAnalysis
++}
++
++export async function saveRemoteAccessAnalysis(
++	umbreld: Pick<Umbreld, 'dataDirectory'>,
++	appId: string,
++	saved: SavedRemoteAccess,
++) {
++	if (!validAppId(appId)) return
++	const directory = `${remoteAccessDirectory(umbreld)}/analysis`
++	await fse.ensureDir(directory)
++	const path = `${directory}/${appId}.json`
++	await fse.writeFile(`${path}.tmp`, `${JSON.stringify(saved, null, '\t')}\n`)
++	await fse.rename(`${path}.tmp`, path)
++}
++
++// True when the app was started with its own base URL moved to its main
++// remote host (a base-url entry, or one declared on the main port), so it
++// expects requests on that origin. Reads what was applied, not the live
++// analysis, because env changes only take effect when the app restarts.
++export function savedUsesRemoteOrigin(saved: SavedRemoteAccess | null) {
++	if (!saved?.remoteDomainActive || saved.disabled || !saved.analysis?.enabled) return false
++	const {env, mainPort} = saved.analysis
++	return (saved.appliedEnvironment ?? []).some(({service, name}) =>
++		env.some(
++			(entry) =>
++				entry.service === service &&
++				entry.name === name &&
++				(entry.kind === 'base-url' || (entry.kind === 'declared' && entry.port === mainPort)),
++		),
++	)
++}
++
++export async function readSavedRemoteAccessAnalysis(umbreld: Pick<Umbreld, 'dataDirectory'>, appId: string) {
++	if (!validAppId(appId)) return null
++	return (await fse
++		.readJson(`${remoteAccessDirectory(umbreld)}/analysis/${appId}.json`)
++		.catch(() => null)) as SavedRemoteAccess | null
++}
+diff --git a/packages/umbreld/source/modules/lan-ingress/remote-access.ts b/packages/umbreld/source/modules/lan-ingress/remote-access.ts
+new file mode 100644
+index 0000000..e8997d4
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/remote-access.ts
+@@ -0,0 +1,798 @@
++import net from 'node:net'
++
++import {appPortRemoteHost, appRemoteHost, type RemoteDomain} from './remote-domain.js'
++
++// Remote access analysis: which of an app's ports a browser talks to, and
++// which environment values must change so the app works on the remote domain.
++// Pure: callers pass in the manifest, compose file, static exports and device
++// names. Nothing here is app specific. See docs/remote-domain.md
++// ("Remote access for extra ports") for the heuristic in prose.
++
++export type RemoteAccessAuth = 'umbrel' | 'app'
++
++export type RemoteAccessDeclaration = {
++	// false turns extra ports and env rewrites off for this app.
++	enabled?: boolean
++	// When present, replaces the detected browser-facing ports.
++	ports?: Array<{port: number; auth?: RemoteAccessAuth; service?: string; containerPort?: number}>
++	// Per-variable rewrites, merged over the detected ones. `port: 'main'`
++	// points the value at the app's main remote host; `rewrite: false` keeps it.
++	env?: Array<{service?: string; name: string; port?: number | 'main'; rewrite?: boolean}>
++	// When present, replaces the detected trusted-origin variables.
++	origins?: Array<{service?: string; name: string}>
++}
++
++export type RemoteAccessSource = 'heuristic' | 'manifest' | 'local-override'
++
++export type RemoteAccessPortRole = 'main' | 'browser' | 'lan-only'
++
++export type RemoteAccessPort = {
++	port: number
++	service: string
++	containerPort: number
++	role: RemoteAccessPortRole
++	auth: RemoteAccessAuth
++	// Set when a declaration asked for auth: app but it was not honoured.
++	requestedAuth?: RemoteAccessAuth
++	reasons: string[]
++}
++
++export type RemoteAccessEnvKind =
++	// Points at a browser-facing extra port; rewritten to its remote host.
++	| 'rewrite'
++	// Declared explicitly; rewritten as declared.
++	| 'declared'
++	// Declared rewrite: false.
++	| 'kept'
++	// Device URL on the main port: the gateway already maps it (Host/Location).
++	| 'main-port'
++	// The app's own base URL on the main port (APP_URL, NEXTAUTH_URL, ...), in a
++	// service that also has a trusted-origin list. Rewritten to the main remote
++	// host; the original LAN origin is kept in that list.
++	| 'base-url'
++	// A trusted-origins / allowed-hosts list: public origins are appended.
++	| 'trusted-origins'
++	| 'allowed-hosts'
++	// Device URL to a published port, but the variable name looks server-side.
++	| 'server-side'
++	// Device URL on a port this app does not publish (another app or the dashboard).
++	| 'other-port'
++	// Compose service, container name, localhost or private address.
++	| 'internal'
++	// Host or port uses a variable Umbrel cannot resolve.
++	| 'unresolved'
++
++export type RemoteAccessEnv = {
++	service: string
++	name: string
++	kind: RemoteAccessEnvKind
++	// scheme://host:port only. Userinfo, path and query are never stored.
++	url?: string
++	port?: number
++	reason: string
++}
++
++export type RemoteAccessAnalysis = {
++	version: 1
++	appId: string
++	source: RemoteAccessSource
++	enabled: boolean
++	mainPort: number | null
++	gateway: {service: string | null; host: string; port: number} | null
++	ports: RemoteAccessPort[]
++	env: RemoteAccessEnv[]
++	warnings: string[]
++	declarationErrors: string[]
++}
++
++export type RemoteAccessInput = {
++	appId: string
++	manifest: {port?: unknown; remoteAccess?: unknown} | null
++	compose: unknown
++	// Static `export NAME="value"` assignments from the app's exports.sh.
++	exports?: Record<string, string>
++	// Names and addresses of this device: umbrel.local, <hostname>,
++	// <hostname>.local, LAN IPs. Lowercase.
++	deviceHosts?: string[]
++	localOverride?: unknown
++	// Owner allows this app without Umbrel login (allowUnauthenticatedApps), so a
++	// manifest may ask for auth: app on an extra port.
++	manifestAppAuthAllowed?: boolean
++}
++
++const DEVICE_HOST_VARIABLES = new Set(['DEVICE_DOMAIN_NAME', 'DEVICE_HOSTNAME', 'APP_DOMAIN', 'NETWORK_IP'])
++const DEVICE = '\u0000device'
++const LOOPBACK = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '::', 'host.docker.internal'])
++
++// Variable names whose URLs are used server-side even when they name the
++// device, so they are never handed to a browser.
++const SERVER_SIDE_NAME =
++	/(?:^|_)(?:INTERNAL|PRIVATE|BACKEND|UPSTREAM|SERVER_SIDE|DATABASE|DB|REDIS|MONGO|MONGODB|POSTGRES|POSTGRESQL|PG|MYSQL|MARIADB|AMQP|RABBITMQ|BROKER|SMTP|IMAP|MQTT|KAFKA|ELASTICSEARCH|MEILI|QDRANT)(?:_|$)/
++const TRUSTED_ORIGINS_NAME =
++	/(?:^|_)(?:(?:TRUSTED|ALLOWED|ADDITIONAL_TRUSTED|CSRF_TRUSTED)_ORIGINS?|CORS_(?:ALLOWED_)?ORIGINS?|ALLOW_ORIGINS?|ORIGINS)$/
++const ALLOWED_HOSTS_NAME = /(?:^|_)(?:ALLOWED_HOSTS|TRUSTED_HOSTS)$/
++// Names an app uses for its own address: APP_URL, NEXTAUTH_URL, PUBLIC_URL,
++// BASE_URL, SITE_URL, ROOT_URL, APP_ORIGIN, ...
++const BASE_URL_NAME = /(?:^|_)(?:URL|URI|ORIGIN)$/
++const S3_NAME = /(?:^|_)(?:S3|MINIO|BUCKET|OBJECT_STORAGE|OBJECT_STORE)(?:_|$)/
++const S3_IMAGE = /(?:^|\/)(?:minio|rustfs|seaweedfs|garage|localstack|s3)[^/]*(?::|$)/i
++
++const TOKEN = String.raw`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*`
++// scheme :// [userinfo@] host [:port]. Host and port may contain ${VAR}.
++const URL_PATTERN = new RegExp(
++	String.raw`(https?|wss?)://((?:[^\s/?#@"'<>,;]*@)?)((?:\[[0-9a-fA-F:.]+\]|${TOKEN}|[A-Za-z0-9._-])+)(?::((?:${TOKEN}|\d)+))?`,
++	'gi',
++)
++
++type Service = {
++	image?: unknown
++	environment?: unknown
++	env_file?: unknown
++	ports?: unknown
++	container_name?: unknown
++	hostname?: unknown
++}
++
++function services(compose: unknown): Array<[string, Service]> {
++	const value = (compose as {services?: unknown} | null)?.services
++	if (!value || typeof value !== 'object') return []
++	return Object.entries(value as Record<string, Service>).filter(([, service]) => service && typeof service === 'object')
++}
++
++export function serviceEnvironment(service: Service) {
++	const environment = new Map<string, string>()
++	if (Array.isArray(service.environment)) {
++		for (const entry of service.environment) {
++			if (typeof entry !== 'string') continue
++			const separator = entry.indexOf('=')
++			if (separator > 0) environment.set(entry.slice(0, separator), entry.slice(separator + 1))
++		}
++	} else if (service.environment && typeof service.environment === 'object') {
++		for (const [name, value] of Object.entries(service.environment)) {
++			if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
++				environment.set(name, String(value))
++			}
++		}
++	}
++	return environment
++}
++
++// Parse literal assignments from an exports.sh. Command substitutions and
++// anything else dynamic are ignored. Values may reference earlier exports.
++export function parseStaticExports(contents: string) {
++	const exports: Record<string, string> = {}
++	for (const line of contents.split('\n')) {
++		const match = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"`]*)"|'([^']*)'|([^\s"'`;|&]*))\s*(?:#.*)?$/.exec(line)
++		if (!match) continue
++		const value = match[2] ?? match[3] ?? match[4] ?? ''
++		if (match[2] !== undefined && value.includes('$(')) continue
++		exports[match[1]!] = value
++	}
++	return exports
++}
++
++type Variables = Record<string, string>
++
++function variableValue(name: string, fallback: string | undefined, variables: Variables, depth: number): string | undefined {
++	if (DEVICE_HOST_VARIABLES.has(name)) return DEVICE
++	const value = variables[name]
++	if (value !== undefined) return depth > 5 ? undefined : resolveVariables(value, variables, depth + 1)
++	return fallback === undefined ? undefined : resolveVariables(fallback, variables, depth + 1)
++}
++
++// Replace ${VAR}, ${VAR:-default} and $VAR. Unknown variables make the result undefined.
++function resolveVariables(value: string, variables: Variables, depth = 0): string | undefined {
++	let unresolved = false
++	const result = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, a, fallback, b) => {
++		const resolved = variableValue(a ?? b, fallback, variables, depth)
++		if (resolved === undefined) unresolved = true
++		return resolved ?? ''
++	})
++	return unresolved ? undefined : result
++}
++
++export type PublishedPort = {port: number; service: string; containerPort: number}
++
++// Host ports published by the app's own services (app_proxy excluded). UDP,
++// loopback-bound, bare container ports and ranges are not browser reachable.
++export function publishedPorts(compose: unknown, variables: Variables = {}): PublishedPort[] {
++	const result: PublishedPort[] = []
++	for (const [name, service] of services(compose)) {
++		if (name === 'app_proxy' || !Array.isArray(service.ports)) continue
++		for (const entry of service.ports) {
++			let published: unknown
++			let target: unknown
++			let hostIp: string | undefined
++			if (typeof entry === 'object' && entry !== null) {
++				const port = entry as {published?: unknown; target?: unknown; protocol?: unknown; host_ip?: unknown}
++				if (String(port.protocol ?? 'tcp').toLowerCase() !== 'tcp') continue
++				published = port.published
++				target = port.target
++				hostIp = typeof port.host_ip === 'string' ? port.host_ip : undefined
++			} else if (typeof entry === 'string' || typeof entry === 'number') {
++				const raw = resolveVariables(String(entry).trim(), variables)
++				if (!raw || /\/udp$/i.test(raw) || /\/sctp$/i.test(raw)) continue
++				const withoutProtocol = raw.replace(/\/tcp$/i, '')
++				const bracketed = /^\[([^\]]+)\]:(.+)$/.exec(withoutProtocol)
++				const parts = bracketed ? [bracketed[1]!, ...bracketed[2]!.split(':')] : withoutProtocol.split(':')
++				if (parts.length < 2) continue
++				target = parts.at(-1)
++				published = parts.at(-2)
++				hostIp = parts.length > 2 ? parts.slice(0, -2).join(':') : undefined
++			} else {
++				continue
++			}
++			const port = Number(typeof published === 'string' ? resolveVariables(published, variables) : published)
++			const containerPort = Number(typeof target === 'string' ? resolveVariables(target, variables) : target)
++			if (!isPort(port) || !isPort(containerPort)) continue
++			if (hostIp && LOOPBACK.has(hostIp.toLowerCase())) continue
++			if (!result.some((existing) => existing.port === port)) result.push({port, service: name, containerPort})
++		}
++	}
++	return result.sort((a, b) => a.port - b.port)
++}
++
++function isPort(value: number) {
++	return Number.isInteger(value) && value > 0 && value <= 65_535
++}
++
++type HostKind = 'device' | 'internal' | 'external' | 'unresolved'
++
++function internalNames(appId: string, compose: unknown) {
++	const names = new Set<string>()
++	for (const [name, service] of services(compose)) {
++		names.add(name.toLowerCase())
++		names.add(`${appId}_${name}_1`.toLowerCase())
++		if (typeof service.container_name === 'string') names.add(service.container_name.toLowerCase())
++		if (typeof service.hostname === 'string') names.add(service.hostname.toLowerCase())
++	}
++	return names
++}
++
++function isPrivateIp(host: string) {
++	if (net.isIPv4(host)) {
++		const [a, b] = host.split('.').map(Number) as [number, number]
++		return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)
++	}
++	if (net.isIPv6(host)) return host === '::1' || /^f[cd]/i.test(host) || /^fe[89ab]/i.test(host)
++	return false
++}
++
++type ParsedUrl = {
++	index: number
++	length: number
++	scheme: string
++	userinfo: string
++	host: string | undefined
++	hostKind: HostKind
++	port: number | undefined
++	explicitPort: boolean
++}
++
++type Context = {appId: string; variables: Variables; deviceHosts: Set<string>; internal: Set<string>}
++
++function classifyHost(host: string | undefined, context: Context): HostKind {
++	if (host === undefined) return 'unresolved'
++	const name = host.replace(/^\[|\]$/g, '').toLowerCase()
++	if (name === DEVICE || name === `${DEVICE}.local`) return 'device'
++	if (name.includes(DEVICE)) return 'unresolved'
++	if (context.deviceHosts.has(name)) return 'device'
++	if (LOOPBACK.has(name) || context.internal.has(name) || /_\d+$/.test(name)) return 'internal'
++	if (net.isIP(name)) return isPrivateIp(name) ? 'internal' : 'external'
++	if (!name.includes('.')) return 'internal'
++	return 'external'
++}
++
++function findUrls(value: string, context: Context): ParsedUrl[] {
++	const urls: ParsedUrl[] = []
++	for (const match of value.matchAll(URL_PATTERN)) {
++		const [whole, scheme, userinfo, rawHost, rawPort] = match
++		const host = resolveVariables(rawHost!, context.variables)
++		const hostKind = classifyHost(host, context)
++		let port: number | undefined
++		if (rawPort !== undefined) {
++			const resolved = resolveVariables(rawPort, context.variables)
++			port = resolved !== undefined && /^\d+$/.test(resolved) ? Number(resolved) : undefined
++		} else {
++			port = /^(?:https|wss)$/i.test(scheme!) ? 443 : 80
++		}
++		urls.push({
++			index: match.index!,
++			length: whole.length,
++			scheme: scheme!.toLowerCase(),
++			userinfo: userinfo ?? '',
++			host,
++			hostKind: rawPort !== undefined && port === undefined && hostKind === 'device' ? 'unresolved' : hostKind,
++			port,
++			explicitPort: rawPort !== undefined,
++		})
++	}
++	return urls
++}
++
++function displayUrl(url: ParsedUrl) {
++	const host = url.hostKind === 'device' ? '<device>' : url.host?.includes(DEVICE) ? '<device>' : (url.host ?? '<unresolved>')
++	return `${url.scheme}://${host}${url.port === undefined ? ':<unresolved>' : `:${url.port}`}`
++}
++
++type ParsedDeclaration = {declaration?: RemoteAccessDeclaration; errors: string[]}
++
++// Validate a remoteAccess block. Invalid entries are dropped and reported.
++export function parseRemoteAccessDeclaration(value: unknown, label: string): ParsedDeclaration {
++	if (value === undefined || value === null) return {errors: []}
++	if (typeof value !== 'object' || Array.isArray(value)) return {errors: [`${label}: remoteAccess must be a mapping`]}
++	const input = value as Record<string, unknown>
++	const errors: string[] = []
++	const declaration: RemoteAccessDeclaration = {}
++	const name = (entry: unknown) => typeof entry === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry)
++	const service = (entry: unknown) => entry === undefined || (typeof entry === 'string' && /^[A-Za-z0-9._-]+$/.test(entry))
++	for (const key of Object.keys(input)) {
++		if (!['enabled', 'ports', 'env', 'origins'].includes(key)) errors.push(`${label}: unknown key '${key}'`)
++	}
++	if (input.enabled !== undefined) {
++		if (typeof input.enabled === 'boolean') declaration.enabled = input.enabled
++		else errors.push(`${label}: enabled must be true or false`)
++	}
++	if (input.ports !== undefined) {
++		declaration.ports = []
++		for (const [index, entry] of (Array.isArray(input.ports) ? input.ports : []).entries()) {
++			const port = typeof entry === 'number' ? {port: entry} : (entry as Record<string, unknown>)
++			const auth = port?.auth ?? 'umbrel'
++			if (
++				!port ||
++				!isPort(Number(port.port)) ||
++				(auth !== 'umbrel' && auth !== 'app') ||
++				!service(port.service) ||
++				(port.containerPort !== undefined && !isPort(Number(port.containerPort)))
++			) {
++				errors.push(`${label}: ports[${index}] is invalid`)
++				continue
++			}
++			declaration.ports.push({
++				port: Number(port.port),
++				auth,
++				...(port.service ? {service: port.service as string} : {}),
++				...(port.containerPort ? {containerPort: Number(port.containerPort)} : {}),
++			})
++		}
++		if (!Array.isArray(input.ports)) errors.push(`${label}: ports must be a list`)
++	}
++	if (input.env !== undefined) {
++		declaration.env = []
++		for (const [index, entry] of (Array.isArray(input.env) ? input.env : []).entries()) {
++			const env = entry as Record<string, unknown>
++			const port = env?.port
++			if (
++				!env ||
++				!name(env.name) ||
++				!service(env.service) ||
++				(port !== undefined && port !== 'main' && !isPort(Number(port))) ||
++				(env.rewrite !== undefined && typeof env.rewrite !== 'boolean') ||
++				(port === undefined && env.rewrite !== false)
++			) {
++				errors.push(`${label}: env[${index}] is invalid`)
++				continue
++			}
++			declaration.env.push({
++				name: env.name as string,
++				...(env.service ? {service: env.service as string} : {}),
++				...(port !== undefined ? {port: port === 'main' ? 'main' : Number(port)} : {}),
++				...(env.rewrite === false ? {rewrite: false} : {}),
++			})
++		}
++		if (!Array.isArray(input.env)) errors.push(`${label}: env must be a list`)
++	}
++	if (input.origins !== undefined) {
++		declaration.origins = []
++		for (const [index, entry] of (Array.isArray(input.origins) ? input.origins : []).entries()) {
++			const origin = typeof entry === 'string' ? {name: entry} : (entry as Record<string, unknown>)
++			if (!origin || !name(origin.name) || !service(origin.service)) {
++				errors.push(`${label}: origins[${index}] is invalid`)
++				continue
++			}
++			declaration.origins.push({name: origin.name as string, ...(origin.service ? {service: origin.service as string} : {})})
++		}
++		if (!Array.isArray(input.origins)) errors.push(`${label}: origins must be a list`)
++	}
++	return {declaration, errors}
++}
++
++// The whole value is one URL (with an optional path), not a list or a string
++// with other text in it.
++function isSingleUrl(value: string) {
++	const trimmed = value.trim()
++	URL_PATTERN.lastIndex = 0
++	const match = URL_PATTERN.exec(trimmed)
++	URL_PATTERN.lastIndex = 0
++	return !!match && match.index === 0 && !/[\s,;]/.test(trimmed)
++}
++
++function matchesEntry(entry: {service?: string; name: string}, service: string, name: string) {
++	return entry.name === name && (entry.service === undefined || entry.service === service)
++}
++
++function isS3Port(port: PublishedPort, compose: unknown, envNames: string[]) {
++	const service = services(compose).find(([name]) => name === port.service)?.[1]
++	return (typeof service?.image === 'string' && S3_IMAGE.test(service.image)) || envNames.some((name) => S3_NAME.test(name))
++}
++
++export function analyseRemoteAccess(input: RemoteAccessInput): RemoteAccessAnalysis {
++	const {appId, compose} = input
++	const manifestPort = Number(input.manifest?.port)
++	const mainPort = isPort(manifestPort) ? manifestPort : null
++	const variables: Variables = {
++		...(input.exports ?? {}),
++		APP_ID: appId,
++		...(mainPort ? {APP_PROXY_PORT: String(mainPort)} : {}),
++	}
++	const context: Context = {
++		appId,
++		variables,
++		deviceHosts: new Set(['umbrel.local', ...(input.deviceHosts ?? [])].map((host) => host.toLowerCase())),
++		internal: internalNames(appId, compose),
++	}
++	const warnings: string[] = []
++
++	// Precedence: local override, then manifest, then the heuristic.
++	const local = parseRemoteAccessDeclaration(input.localOverride, 'local override')
++	const manifest = parseRemoteAccessDeclaration(input.manifest?.remoteAccess, 'manifest')
++	const declarationErrors = [...local.errors, ...manifest.errors]
++	const source: RemoteAccessSource = local.declaration
++		? 'local-override'
++		: manifest.declaration
++			? 'manifest'
++			: 'heuristic'
++	const declaration = local.declaration ?? manifest.declaration
++	const enabled = declaration?.enabled !== false
++
++	const allServices = services(compose)
++	const appProxy = allServices.find(([name]) => name === 'app_proxy')?.[1]
++	let gateway: RemoteAccessAnalysis['gateway'] = null
++	if (appProxy) {
++		const environment = serviceEnvironment(appProxy)
++		const host = resolveVariables(environment.get('APP_HOST') ?? '', variables)?.trim()
++		const port = Number(resolveVariables(environment.get('APP_PORT') ?? '', variables))
++		if (host && isPort(port)) {
++			const lower = host.toLowerCase()
++			const service =
++				allServices.find(
++					([name, service]) =>
++						name !== 'app_proxy' &&
++						(name.toLowerCase() === lower ||
++							`${appId}_${name}_1`.toLowerCase() === lower ||
++							(typeof service.container_name === 'string' && service.container_name.toLowerCase() === lower) ||
++							(typeof service.hostname === 'string' && service.hostname.toLowerCase() === lower)),
++				)?.[0] ?? null
++			gateway = {service, host, port}
++		}
++	}
++
++	const published = publishedPorts(compose, variables)
++	const publishedByPort = new Map(published.map((port) => [port.port, port]))
++	const declaredEnv = declaration?.env ?? []
++	const declaredOrigins = declaration?.origins
++
++	const env: RemoteAccessEnv[] = []
++	const browserPorts = new Map<number, {reasons: string[]; envNames: string[]}>()
++	const addBrowserPort = (port: number, reason: string, envName?: string) => {
++		const entry = browserPorts.get(port) ?? {reasons: [], envNames: []}
++		if (!entry.reasons.includes(reason)) entry.reasons.push(reason)
++		if (envName) entry.envNames.push(envName)
++		browserPorts.set(port, entry)
++	}
++
++	// Services whose own config trusts more than one origin (a trusted-origin
++	// list, or *). Only there is a main-port base URL rewritten: the LAN origin
++	// stays trusted next to the remote one, so LAN logins keep passing the
++	// app's origin check.
++	const isTrustedList = (serviceName: string, name: string) =>
++		declaredOrigins
++			? declaredOrigins.some((entry) => matchesEntry(entry, serviceName, name))
++			: TRUSTED_ORIGINS_NAME.test(name)
++	const multiOriginServices = new Set(
++		allServices
++			.filter(([serviceName, service]) => [...serviceEnvironment(service).keys()].some((name) => isTrustedList(serviceName, name)))
++			.map(([serviceName]) => serviceName),
++	)
++
++	for (const [serviceName, service] of allServices) {
++		if (serviceName === 'app_proxy') continue
++		if (service.env_file !== undefined) {
++			warnings.push(
++				`Service '${serviceName}' loads an env_file, which is not scanned. Declare any browser-facing URL in it under remoteAccess.env.`,
++			)
++		}
++		for (const [name, value] of serviceEnvironment(service)) {
++			const declared = declaredEnv.find((entry) => matchesEntry(entry, serviceName, name))
++			if (isTrustedList(serviceName, name)) {
++				const wildcard = value.split(/[\s,]+/).includes('*')
++				env.push({
++					service: serviceName,
++					name,
++					kind: 'trusted-origins',
++					reason: wildcard ? 'Allows any origin (*); left unchanged' : 'Trusted-origin list; remote origins are appended',
++				})
++				continue
++			}
++			if (!declaredOrigins && ALLOWED_HOSTS_NAME.test(name)) {
++				const wildcard = value.split(/[\s,]+/).includes('*')
++				env.push({
++					service: serviceName,
++					name,
++					kind: 'allowed-hosts',
++					reason: wildcard ? 'Allows any host (*); left unchanged' : 'Allowed-hosts list; remote hosts are appended',
++				})
++				continue
++			}
++			const urls = findUrls(value, context)
++			if (declared) {
++				if (declared.rewrite === false) {
++					env.push({service: serviceName, name, kind: 'kept', reason: `Declared rewrite: false (${source})`})
++					continue
++				}
++				const target = declared.port === 'main' ? 'main' : declared.port!
++				const first = urls.find((url) => url.hostKind === 'device' || url.hostKind === 'unresolved')
++				env.push({
++					service: serviceName,
++					name,
++					kind: 'declared',
++					...(first ? {url: displayUrl(first)} : {}),
++					...(target === 'main' ? (mainPort ? {port: mainPort} : {}) : {port: target}),
++					reason: `Declared in ${source}: points at ${target === 'main' ? 'the main host' : `port ${target}`}`,
++				})
++				if (!first) warnings.push(`Declared variable ${serviceName}.${name} has no device URL to rewrite.`)
++				continue
++			}
++			for (const url of urls) {
++				const entry = {service: serviceName, name, url: displayUrl(url), ...(url.port ? {port: url.port} : {})}
++				if (url.hostKind === 'external') continue
++				if (url.hostKind === 'internal') {
++					env.push({...entry, kind: 'internal', reason: 'Container, service or loopback address; never rewritten'})
++					continue
++				}
++				if (url.hostKind === 'unresolved' || url.port === undefined) {
++					env.push({...entry, kind: 'unresolved', reason: 'Host or port uses a variable Umbrel cannot resolve'})
++					warnings.push(
++						`${serviceName}.${name} uses a URL Umbrel cannot resolve. If a browser uses it, declare it under remoteAccess.env.`,
++					)
++					continue
++				}
++				if (url.port === mainPort) {
++					const baseUrl = BASE_URL_NAME.test(name) && !SERVER_SIDE_NAME.test(name) && isSingleUrl(value)
++					if (baseUrl && enabled && multiOriginServices.has(serviceName)) {
++						env.push({
++							...entry,
++							kind: 'base-url',
++							reason:
++								"The app's own address on the main port; rewritten to the main remote host. The service has a trusted-origin list, so the LAN origin stays trusted there",
++						})
++						continue
++					}
++					env.push({
++						...entry,
++						kind: 'main-port',
++						reason: baseUrl
++							? "The app's own address on the main port, but the service has no trusted-origin list, so the app may accept only one origin; not rewritten. Declare it with port: main to rewrite it"
++							: 'Main port: the gateway already maps Host, Origin and redirects, so it is not rewritten',
++					})
++					continue
++				}
++				const port = publishedByPort.get(url.port)
++				if (!port) {
++					env.push({...entry, kind: 'other-port', reason: 'Not a port this app publishes; left unchanged'})
++					continue
++				}
++				if (SERVER_SIDE_NAME.test(name)) {
++					env.push({...entry, kind: 'server-side', reason: 'Variable name looks server-side; not rewritten'})
++					warnings.push(
++						`${serviceName}.${name} points at published port ${url.port} but its name looks server-side, so it is not rewritten. Declare it if a browser uses it.`,
++					)
++					continue
++				}
++				env.push({...entry, kind: 'rewrite', reason: `Browser-facing URL to published port ${url.port}`})
++				if (!declaration?.ports) addBrowserPort(url.port, `${serviceName}.${name} hands a browser ${displayUrl(url)}`, name)
++			}
++		}
++	}
++	for (const entry of declaredEnv) {
++		if (!env.some((item) => matchesEntry(entry, item.service, item.name) && (item.kind === 'declared' || item.kind === 'kept'))) {
++			warnings.push(`Declared variable ${entry.service ? `${entry.service}.` : ''}${entry.name} is not set in the compose file.`)
++		}
++	}
++
++	const ports: RemoteAccessPort[] = []
++	const manifestAppAuthAllowed = !!input.manifestAppAuthAllowed
++	if (declaration?.ports) {
++		for (const declared of declaration.ports) {
++			const publishedPort = publishedByPort.get(declared.port)
++			const service = declared.service ?? publishedPort?.service
++			const containerPort = declared.containerPort ?? publishedPort?.containerPort
++			if (!service || !containerPort || !allServices.some(([name]) => name === service)) {
++				declarationErrors.push(`${source}: port ${declared.port} is not published; give service and containerPort`)
++				continue
++			}
++			if (declared.port === mainPort) {
++				declarationErrors.push(`${source}: port ${declared.port} is the main port`)
++				continue
++			}
++			const wantsAppAuth = declared.auth === 'app'
++			const honoured = wantsAppAuth && (source === 'local-override' || manifestAppAuthAllowed)
++			ports.push({
++				port: declared.port,
++				service,
++				containerPort,
++				role: 'browser',
++				auth: honoured ? 'app' : 'umbrel',
++				...(wantsAppAuth && !honoured ? {requestedAuth: 'app' as const} : {}),
++				reasons: [
++					`Declared in ${source}`,
++					...(wantsAppAuth && !honoured
++						? ["The manifest asks for auth: app; kept behind Umbrel login until the owner allows this app without Umbrel's login"]
++						: []),
++				],
++			})
++		}
++	} else {
++		for (const [port, detail] of browserPorts) {
++			const publishedPort = publishedByPort.get(port)!
++			ports.push({...publishedPort, role: 'browser', auth: 'umbrel', reasons: detail.reasons})
++		}
++	}
++	// Declared env entries pointing at a port that is not routed are an error.
++	for (const entry of env) {
++		if (entry.kind !== 'declared' || entry.port === undefined || entry.port === mainPort) continue
++		if (!ports.some((port) => port.port === entry.port)) {
++			declarationErrors.push(`${source}: ${entry.service}.${entry.name} points at port ${entry.port}, which is not a declared port`)
++		}
++	}
++	for (const port of published) {
++		if (ports.some((existing) => existing.port === port.port)) continue
++		ports.push({
++			...port,
++			role: port.port === mainPort ? 'main' : 'lan-only',
++			auth: 'umbrel',
++			reasons: [
++				port.port === mainPort ? 'Main port published directly' : 'Published, but no browser-facing URL points at it; LAN only',
++			],
++		})
++	}
++	ports.sort((a, b) => a.port - b.port)
++
++	for (const port of ports) {
++		if (port.role !== 'browser' || port.auth !== 'umbrel') continue
++		const envNames = browserPorts.get(port.port)?.envNames ?? []
++		if (isS3Port(port, compose, envNames)) {
++			warnings.push(
++				`Port ${port.port} looks like S3 object storage. Browsers usually send presigned uploads with fetch() and no credentials, so they carry no Umbrel cookie and get 401 on the remote host; <img> loads and downloads work. If remote uploads fail, declare this port with auth: app in the local override (the storage server then relies on its own signatures).`,
++			)
++		}
++	}
++
++	return {
++		version: 1,
++		appId,
++		source,
++		enabled,
++		mainPort,
++		gateway,
++		ports: enabled ? ports : ports.map((port) => ({...port, role: port.role === 'main' ? 'main' : 'lan-only'})),
++		env,
++		warnings,
++		declarationErrors,
++	}
++}
++
++// The extra hosts an analysis asks for: browser-facing ports only.
++export function remoteAccessPorts(analysis: RemoteAccessAnalysis) {
++	if (!analysis.enabled) return []
++	return analysis.ports.filter((port) => port.role === 'browser')
++}
++
++export function remoteAccessOrigins(remote: RemoteDomain, appId: string, analysis: RemoteAccessAnalysis) {
++	const main = appRemoteHost(remote, appId)
++	const hosts = [
++		...(main ? [main] : []),
++		...remoteAccessPorts(analysis).flatMap((port) => appPortRemoteHost(remote, appId, port.port) ?? []),
++	]
++	return hosts
++}
++
++function appendToList(value: string, additions: string[]) {
++	const separator = value.includes(',') || !/\s/.test(value.trim()) ? ',' : ' '
++	const existing = value.split(/[\s,]+/).filter(Boolean)
++	const missing = additions.filter((addition) => !existing.includes(addition))
++	if (!missing.length) return value
++	return value.trim() ? `${value.trim()}${separator}${missing.join(separator)}` : missing.join(separator)
++}
++
++// Environment overrides for the user-settings compose file, keyed by service.
++// Values keep every ${VAR} they had except the rewritten host and port.
++export function remoteAccessEnvironment({
++	remote,
++	appId,
++	analysis,
++	compose,
++	exports = {},
++	deviceHosts = [],
++}: {
++	remote: RemoteDomain
++	appId: string
++	analysis: RemoteAccessAnalysis
++	compose: unknown
++	exports?: Record<string, string>
++	deviceHosts?: string[]
++}) {
++	const overrides: Record<string, Record<string, string>> = {}
++	if (!analysis.enabled) return overrides
++	const routed = new Map(
++		remoteAccessPorts(analysis).flatMap((port) => {
++			const host = appPortRemoteHost(remote, appId, port.port)
++			return host ? [[port.port, host] as const] : []
++		}),
++	)
++	const mainHost = appRemoteHost(remote, appId)
++	const hosts = remoteAccessOrigins(remote, appId, analysis)
++	const origins = hosts.map((host) => `https://${host}`)
++	const mainPort = analysis.mainPort
++	const context: Context = {
++		appId,
++		variables: {...exports, APP_ID: appId, ...(mainPort ? {APP_PROXY_PORT: String(mainPort)} : {})},
++		deviceHosts: new Set(['umbrel.local', ...deviceHosts].map((host) => host.toLowerCase())),
++		internal: internalNames(appId, compose),
++	}
++	const byService = new Map(services(compose))
++	const set = (service: string, name: string, value: string) => {
++		;(overrides[service] ??= {})[name] = value
++	}
++	// Base URLs moved to the main remote host keep their LAN origin trusted in
++	// the same service's trusted-origin lists (as written, ${VAR} included).
++	const lanOrigins = new Map<string, string[]>()
++	for (const entry of analysis.env) {
++		const movesMain = entry.kind === 'base-url' || (entry.kind === 'declared' && entry.port === mainPort)
++		if (!movesMain) continue
++		const raw = byService.get(entry.service) && serviceEnvironment(byService.get(entry.service)!).get(entry.name)
++		if (raw === undefined) continue
++		for (const url of findUrls(raw, context)) {
++			if (url.hostKind !== 'device' && url.hostKind !== 'unresolved') continue
++			const origin = raw.slice(url.index, url.index + url.length).replace(/\/\/[^@/]*@/, '//')
++			const list = lanOrigins.get(entry.service) ?? []
++			if (!list.includes(origin)) list.push(origin)
++			lanOrigins.set(entry.service, list)
++		}
++	}
++	for (const entry of analysis.env) {
++		const raw = byService.get(entry.service) && serviceEnvironment(byService.get(entry.service)!).get(entry.name)
++		if (raw === undefined) continue
++		if (entry.kind === 'trusted-origins' || entry.kind === 'allowed-hosts') {
++			if (raw.split(/[\s,]+/).includes('*')) continue
++			const additions =
++				entry.kind === 'trusted-origins' ? [...(lanOrigins.get(entry.service) ?? []), ...origins] : hosts
++			const next = appendToList(raw, additions)
++			if (next !== raw) set(entry.service, entry.name, next)
++			continue
++		}
++		if (entry.kind !== 'rewrite' && entry.kind !== 'declared' && entry.kind !== 'base-url') continue
++		const targetHost =
++			entry.kind === 'base-url' || (entry.kind === 'declared' && entry.port === mainPort)
++				? mainHost
++				: entry.port
++					? routed.get(entry.port)
++					: undefined
++		if (!targetHost) continue
++		let next = ''
++		let last = 0
++		for (const url of findUrls(raw, context)) {
++			const matches =
++				entry.kind === 'declared'
++					? url.hostKind === 'device' || url.hostKind === 'unresolved'
++					: url.hostKind === 'device' && url.port === entry.port
++			if (!matches) continue
++			const scheme = url.scheme === 'ws' || url.scheme === 'wss' ? 'wss' : 'https'
++			next += `${raw.slice(last, url.index)}${scheme}://${url.userinfo}${targetHost}`
++			last = url.index + url.length
++		}
++		next += raw.slice(last)
++		if (next !== raw) set(entry.service, entry.name, next)
++	}
++	return overrides
++}
+diff --git a/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts
+new file mode 100644
+index 0000000..5c61508
+--- /dev/null
++++ b/packages/umbreld/source/modules/lan-ingress/remote-access.unit.test.ts
+@@ -0,0 +1,323 @@
++import fs from 'node:fs'
++import path from 'node:path'
++import {fileURLToPath} from 'node:url'
++
++import {describe, expect, test} from 'vitest'
++import yaml from 'js-yaml'
++
++import {
++	analyseRemoteAccess,
++	parseRemoteAccessDeclaration,
++	parseStaticExports,
++	publishedPorts,
++	remoteAccessEnvironment,
++	remoteAccessOrigins,
++	remoteAccessPorts,
++	type RemoteAccessAnalysis,
++} from './remote-access.js'
++import {resolveRemoteDomain} from './remote-domain.js'
++import {savedUsesRemoteOrigin, type SavedRemoteAccess} from './remote-access-files.js'
++
++// Fixtures are getumbrel/umbrel-apps templates with fake values for secrets.
++const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'remote-access')
++const remote = resolveRemoteDomain({enabled: true, baseDomain: 'example.com'})!
++const deviceHosts = ['umbrel.local', 'umbrel', '192.168.1.20']
++
++function fixture(appId: string) {
++	const read = (file: string) => {
++		const full = path.join(fixtures, appId, file)
++		return fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : undefined
++	}
++	return {
++		manifest: yaml.load(read('umbrel-app.yml')!) as {port?: unknown; remoteAccess?: unknown},
++		compose: yaml.load(read('docker-compose.yml')!),
++		exports: parseStaticExports(read('exports.sh') ?? ''),
++	}
++}
++
++function analyse(appId: string, extra: Partial<Parameters<typeof analyseRemoteAccess>[0]> = {}) {
++	const {manifest, compose, exports} = fixture(appId)
++	const analysis = analyseRemoteAccess({appId, manifest, compose, exports, deviceHosts, ...extra})
++	const environment = remoteAccessEnvironment({remote, appId, analysis, compose, exports, deviceHosts})
++	return {analysis, environment, compose}
++}
++
++const kinds = (analysis: RemoteAccessAnalysis) =>
++	Object.fromEntries(analysis.env.map((entry) => [`${entry.service}.${entry.name}`, entry.kind]))
++
++describe('analyseRemoteAccess on app-store templates', () => {
++	test('lobe-chat: S3 and agent gateway ports are browser-facing, device gateway stays LAN only', () => {
++		const {analysis, environment} = analyse('lobe-chat')
++		expect(analysis.source).toBe('heuristic')
++		expect(analysis.mainPort).toBe(7455)
++		expect(analysis.gateway).toEqual({service: 'app', host: 'lobe-chat_app_1', port: 3210})
++		expect(remoteAccessPorts(analysis).map((port) => [port.port, port.service, port.containerPort, port.auth])).toEqual([
++			[7458, 'rustfs', 9000, 'umbrel'],
++			[7459, 'gateway', 8787, 'umbrel'],
++		])
++		expect(analysis.ports.find((port) => port.port === 7460)?.role).toBe('lan-only')
++		expect(kinds(analysis)).toMatchObject({
++			'app.APP_URL': 'base-url',
++			'app.AUTH_TRUSTED_ORIGINS': 'trusted-origins',
++			'app.S3_ENDPOINT': 'rewrite',
++			'app.AGENT_GATEWAY_URL': 'rewrite',
++			'app.INTERNAL_APP_URL': 'internal',
++			'app.S3_INTERNAL_ENDPOINT': 'internal',
++			'gateway.LOBE_API_BASE_URL': 'internal',
++		})
++		expect(analysis.warnings.some((warning) => warning.includes('Port 7458 looks like S3'))).toBe(true)
++		expect(analysis.warnings.some((warning) => warning.includes('env_file'))).toBe(true)
++		expect(environment).toEqual({
++			app: {
++				APP_URL: 'https://lobe-chat-umbrel.example.com',
++				S3_ENDPOINT: 'https://lobe-chat-7458-umbrel.example.com',
++				AGENT_GATEWAY_URL: 'https://lobe-chat-7459-umbrel.example.com',
++				AUTH_TRUSTED_ORIGINS:
++					'http://${DEVICE_DOMAIN_NAME}:7455,https://lobe-chat-umbrel.example.com,https://lobe-chat-7458-umbrel.example.com,https://lobe-chat-7459-umbrel.example.com',
++			},
++		})
++		// Never stores credentials from URLs.
++		expect(JSON.stringify(analysis)).not.toContain('fake-password')
++	})
++
++	test('ollama: no extra ports, wildcard origins left alone', () => {
++		const {analysis, environment} = analyse('ollama')
++		expect(remoteAccessPorts(analysis)).toEqual([])
++		expect(analysis.env.find((entry) => entry.name === 'OLLAMA_ORIGINS')?.kind).toBe('trusted-origins')
++		expect(environment).toEqual({})
++	})
++
++	test('murmur: wildcard allowed hosts left alone, no extra ports', () => {
++		const {analysis, environment} = analyse('murmur')
++		expect(remoteAccessPorts(analysis)).toEqual([])
++		expect(Object.values(environment).flatMap(Object.keys)).not.toContain('ALLOWED_HOSTS')
++	})
++
++	test('librechat: no extra ports, env_file warning', () => {
++		const {analysis, environment} = analyse('librechat')
++		expect(remoteAccessPorts(analysis)).toEqual([])
++		expect(analysis.warnings.some((warning) => warning.includes('env_file'))).toBe(true)
++		expect(environment).toEqual({})
++	})
++
++	test.each(['stirling-pdf', 'openclaw', 'ekko-studio'])('%s: no extra ports and no rewrites', (appId) => {
++		const {analysis, environment} = analyse(appId)
++		expect(analysis.gateway).not.toBeNull()
++		expect(remoteAccessPorts(analysis)).toEqual([])
++		expect(analysis.env.filter((entry) => entry.kind === 'rewrite')).toEqual([])
++		expect(environment).toEqual({})
++	})
++})
++
++describe('declarations', () => {
++	test('local override wins over manifest and can turn auth off for a port', () => {
++		const {manifest} = fixture('lobe-chat')
++		const {analysis} = analyse('lobe-chat', {
++			manifest: {...manifest, remoteAccess: {ports: [{port: 7459}]}},
++			localOverride: {ports: [{port: 7458, auth: 'app'}, {port: 7459}]},
++		})
++		expect(analysis.source).toBe('local-override')
++		expect(remoteAccessPorts(analysis).map((port) => [port.port, port.auth])).toEqual([
++			[7458, 'app'],
++			[7459, 'umbrel'],
++		])
++	})
++
++	test('manifest auth: app is only honoured when the owner allows the app without Umbrel login', () => {
++		const {manifest} = fixture('lobe-chat')
++		const declared = {...manifest, remoteAccess: {ports: [{port: 7458, auth: 'app'}]}}
++		const denied = analyse('lobe-chat', {manifest: declared}).analysis
++		expect(denied.source).toBe('manifest')
++		expect(remoteAccessPorts(denied)).toMatchObject([{port: 7458, auth: 'umbrel', requestedAuth: 'app'}])
++		const allowed = analyse('lobe-chat', {manifest: declared, manifestAppAuthAllowed: true}).analysis
++		expect(remoteAccessPorts(allowed)).toMatchObject([{port: 7458, auth: 'app'}])
++	})
++
++	test('enabled: false removes extra ports and rewrites', () => {
++		const {analysis, environment} = analyse('lobe-chat', {localOverride: {enabled: false}})
++		expect(analysis.enabled).toBe(false)
++		expect(remoteAccessPorts(analysis)).toEqual([])
++		expect(environment).toEqual({})
++	})
++
++	test('declared env and rewrite: false', () => {
++		const {analysis, environment} = analyse('lobe-chat', {
++			localOverride: {env: [{name: 'APP_URL', port: 'main'}, {name: 'S3_ENDPOINT', rewrite: false}]},
++		})
++		expect(kinds(analysis)['app.APP_URL']).toBe('declared')
++		expect(kinds(analysis)['app.S3_ENDPOINT']).toBe('kept')
++		expect(environment.app.APP_URL).toBe('https://lobe-chat-umbrel.example.com')
++		expect(environment.app.S3_ENDPOINT).toBeUndefined()
++		expect(environment.app.AGENT_GATEWAY_URL).toBe('https://lobe-chat-7459-umbrel.example.com')
++	})
++
++	test('rewrite: false keeps the app base URL on its LAN address', () => {
++		const {analysis, environment} = analyse('lobe-chat', {localOverride: {env: [{name: 'APP_URL', rewrite: false}]}})
++		expect(kinds(analysis)['app.APP_URL']).toBe('kept')
++		expect(environment.app.APP_URL).toBeUndefined()
++		expect(environment.app.S3_ENDPOINT).toBe('https://lobe-chat-7458-umbrel.example.com')
++	})
++
++	test('a declared port that is not published needs service and containerPort', () => {
++		const {analysis} = analyse('lobe-chat', {localOverride: {ports: [{port: 9999}]}})
++		expect(analysis.declarationErrors.some((error) => error.includes('port 9999 is not published'))).toBe(true)
++	})
++
++	test('invalid declarations are reported, not applied', () => {
++		const parsed = parseRemoteAccessDeclaration({ports: [{port: 'abc'}], auth: 1}, 'manifest')
++		expect(parsed.errors.length).toBeGreaterThan(0)
++	})
++})
++
++describe('helpers', () => {
++	test('publishedPorts reads short, long and variable syntax', () => {
++		const compose = {
++			services: {
++				a: {ports: ['7000:80', '127.0.0.1:7001:81/tcp', '${APP_X_PORT}:82', '7003:83/udp']},
++				b: {ports: [{published: 7004, target: 84}, {published: '7005', target: 85, protocol: 'tcp'}]},
++			},
++		}
++		expect(publishedPorts(compose, {APP_X_PORT: '7002'}).map(({port, service, containerPort}) => [port, service, containerPort])).toEqual(
++			expect.arrayContaining([
++				[7000, 'a', 80],
++				[7002, 'a', 82],
++				[7004, 'b', 84],
++				[7005, 'b', 85],
++			]),
++		)
++	})
++
++	test('parseStaticExports only takes literal assignments', () => {
++		expect(
++			parseStaticExports('export A="x"\nexport B=$(cat file)\nexport C=\'y\'\n# export D="z"\nexport E="${A}"'),
++		).toMatchObject({A: 'x', C: 'y'})
++	})
++
++	test('a device URL on an unpublished port is left alone', () => {
++		const analysis = analyseRemoteAccess({
++			appId: 'demo',
++			manifest: {port: 7000},
++			compose: {
++				services: {
++					app_proxy: {environment: {APP_HOST: 'demo_web_1', APP_PORT: 80}},
++					web: {environment: {DASHBOARD_URL: 'http://umbrel.local:80', OTHER_URL: 'http://${DEVICE_DOMAIN_NAME}:8080'}},
++				},
++			},
++		})
++		expect(kinds(analysis)).toMatchObject({'web.DASHBOARD_URL': 'other-port', 'web.OTHER_URL': 'other-port'})
++		expect(remoteAccessOrigins(remote, 'demo', analysis)).toEqual(['demo-umbrel.example.com'])
++	})
++
++	test('server-side names on a published port are not rewritten', () => {
++		const analysis = analyseRemoteAccess({
++			appId: 'demo',
++			manifest: {port: 7000},
++			compose: {
++				services: {
++					app_proxy: {environment: {APP_HOST: 'demo_web_1', APP_PORT: 80}},
++					web: {environment: {BACKEND_API_URL: 'http://umbrel.local:7001', PUBLIC_WS_URL: 'ws://umbrel.local:7002/socket'}},
++					cache: {ports: ['7001:6379']},
++					ws: {ports: ['7002:9000']},
++				},
++			},
++		})
++		expect(remoteAccessPorts(analysis).map((port) => port.port)).toEqual([7002])
++		const environment = remoteAccessEnvironment({remote, appId: 'demo', analysis, compose: {
++			services: {
++				web: {environment: {PUBLIC_WS_URL: 'ws://umbrel.local:7002/socket'}},
++			},
++		}})
++		expect(environment.web.PUBLIC_WS_URL).toBe('wss://demo-7002-umbrel.example.com/socket')
++	})
++	describe('the app base URL on the main port', () => {
++		const run = (environment: Record<string, string>) => {
++			const compose = {
++				services: {
++					app_proxy: {environment: {APP_HOST: 'demo_web_1', APP_PORT: 80}},
++					web: {environment},
++				},
++			}
++			const analysis = analyseRemoteAccess({appId: 'demo', manifest: {port: 7000}, compose, deviceHosts})
++			return {analysis, environment: remoteAccessEnvironment({remote, appId: 'demo', analysis, compose, deviceHosts})}
++		}
++
++		test('is rewritten when the service trusts a list of origins, and the LAN origin stays trusted', () => {
++			const {analysis, environment} = run({
++				NEXTAUTH_URL: 'http://${DEVICE_DOMAIN_NAME}:7000/api/auth',
++				PUBLIC_URL: 'http://umbrel.local:7000',
++				CSRF_TRUSTED_ORIGINS: 'https://example.org',
++			})
++			expect(kinds(analysis)).toMatchObject({'web.NEXTAUTH_URL': 'base-url', 'web.PUBLIC_URL': 'base-url'})
++			expect(environment.web).toEqual({
++				NEXTAUTH_URL: 'https://demo-umbrel.example.com/api/auth',
++				PUBLIC_URL: 'https://demo-umbrel.example.com',
++				CSRF_TRUSTED_ORIGINS:
++					'https://example.org,http://${DEVICE_DOMAIN_NAME}:7000,http://umbrel.local:7000,https://demo-umbrel.example.com',
++			})
++		})
++
++		test('is rewritten next to a wildcard list, which stays as it is', () => {
++			const {environment} = run({APP_URL: 'http://umbrel.local:7000', CORS_ORIGINS: '*'})
++			expect(environment.web).toEqual({APP_URL: 'https://demo-umbrel.example.com'})
++		})
++
++		test('is kept when the app shows no trusted-origin list (it may accept one origin only)', () => {
++			const {analysis, environment} = run({APP_URL: 'http://umbrel.local:7000', BASE_URL: 'http://umbrel.local:7000'})
++			expect(kinds(analysis)).toMatchObject({'web.APP_URL': 'main-port', 'web.BASE_URL': 'main-port'})
++			expect(analysis.env.find((entry) => entry.name === 'APP_URL')?.reason).toContain('port: main')
++			expect(environment).toEqual({})
++		})
++
++		test('server-side names, lists and other names stay untouched', () => {
++			const {analysis, environment} = run({
++				INTERNAL_APP_URL: 'http://umbrel.local:7000',
++				CALLBACK_URLS: 'http://umbrel.local:7000/a,http://umbrel.local:7000/b',
++				WELCOME_TEXT: 'Open http://umbrel.local:7000',
++				TRUSTED_ORIGINS: 'http://umbrel.local:7000',
++			})
++			expect(kinds(analysis)).toMatchObject({
++				'web.INTERNAL_APP_URL': 'main-port',
++				'web.CALLBACK_URLS': 'main-port',
++				'web.WELCOME_TEXT': 'main-port',
++			})
++			expect(Object.keys(environment.web)).toEqual(['TRUSTED_ORIGINS'])
++		})
++	})
++})
++
++// What the gateway reads to choose between LAN and remote presentation.
++describe('savedUsesRemoteOrigin', () => {
++	const saved = (appId: string, extra: Partial<Parameters<typeof analyseRemoteAccess>[0]> = {}): SavedRemoteAccess => {
++		const {analysis, environment} = analyse(appId, extra)
++		return {
++			analysedAt: '2026-01-01T00:00:00.000Z',
++			remoteDomainActive: true,
++			disabled: false,
++			appliedEnvironment: Object.entries(environment).flatMap(([service, values]) =>
++				Object.keys(values).map((name) => ({service, name})),
++			),
++			analysis,
++		}
++	}
++
++	test('is true for an app started with its base URL on the remote origin', () => {
++		expect(savedUsesRemoteOrigin(saved('lobe-chat'))).toBe(true)
++		const declared = saved('lobe-chat', {localOverride: {env: [{name: 'APP_URL', port: 'main'}]}})
++		expect(declared.analysis.source).toBe('local-override')
++		expect(savedUsesRemoteOrigin(declared)).toBe(true)
++	})
++
++	test('is false for apps whose base URL stays on the LAN', () => {
++		for (const appId of ['ekko-studio', 'librechat', 'murmur', 'ollama', 'openclaw', 'stirling-pdf']) {
++			expect(savedUsesRemoteOrigin(saved(appId)), appId).toBe(false)
++		}
++	})
++
++	test('follows what was applied: rewrite false, remote access off, or no remote domain at start', () => {
++		const kept = saved('lobe-chat', {localOverride: {env: [{name: 'APP_URL', rewrite: false}]}})
++		expect(savedUsesRemoteOrigin(kept)).toBe(false)
++		expect(savedUsesRemoteOrigin({...saved('lobe-chat'), disabled: true, appliedEnvironment: []})).toBe(false)
++		expect(savedUsesRemoteOrigin({...saved('lobe-chat'), remoteDomainActive: false})).toBe(false)
++		expect(savedUsesRemoteOrigin(null)).toBe(false)
++	})
++})
+diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
+index bb76a90..d2c3c6a 100644
+--- a/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
++++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.ts
+@@ -21,6 +21,9 @@ export type RemoteDomainSettings = {
+ 	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
+ 	// public on the remote domain. Off for every app by default.
+ 	allowPublicPathApps?: string[]
++	// App ids whose extra browser-facing ports (remote access analysis) get no
++	// remote host and no environment rewrites. The main app host is unaffected.
++	remoteAccessDisabledApps?: string[]
+ 	// Reverse proxies whose X-Forwarded-For (or clientIpHeader) umbreld trusts
+ 	// for remote-domain requests, as IPs or CIDRs. Unset means loopback and
+ 	// private networks, where a proxy on the same machine or network sits.
+@@ -39,6 +42,7 @@ export type RemoteDomain = {
+ 	allowUnauthenticatedApps: string[]
+ 	originRewriteDisabledApps: string[]
+ 	allowPublicPathApps: string[]
++	remoteAccessDisabledApps: string[]
+ 	trustedProxies: string[]
+ 	clientIpHeader?: string
+ }
+@@ -158,6 +162,7 @@ export function resolveRemoteDomain(settings: RemoteDomainSettings | undefined):
+ 		allowUnauthenticatedApps: [...new Set(settings.allowUnauthenticatedApps ?? [])],
+ 		originRewriteDisabledApps: [...new Set(settings.originRewriteDisabledApps ?? [])],
+ 		allowPublicPathApps: [...new Set(settings.allowPublicPathApps ?? [])],
++		remoteAccessDisabledApps: [...new Set(settings.remoteAccessDisabledApps ?? [])],
+ 		trustedProxies: settings.trustedProxies?.length
+ 			? settings.trustedProxies.filter((entry) => !validateTrustedProxy(entry))
+ 			: DEFAULT_TRUSTED_PROXIES,
+@@ -179,6 +184,13 @@ export function appRemoteHost(remote: RemoteDomain, appId: string) {
+ 	return host
+ }
+ 
++// The remote host for one of an app's extra browser-facing ports:
++// `<appId>-<port>` run through the app template, e.g. lobe-chat-7458-umbrel.<domain>.
++export function appPortRemoteHost(remote: RemoteDomain, appId: string, port: number) {
++	if (!Number.isInteger(port) || port <= 0 || port > 65_535) return
++	return appRemoteHost(remote, `${appId}-${port}`)
++}
++
+ export function appRemoteOrigin(remote: RemoteDomain, appId: string) {
+ 	const host = appRemoteHost(remote, appId)
+ 	return host ? `https://${host}` : undefined
+@@ -243,8 +255,10 @@ export function matchRemoteHost(
+ 
+ // The URL the app gateway sends an unauthenticated browser to. Built only from
+ // config: the Host header and request protocol are never reflected.
+-export function remoteAppAuthUrl(remote: RemoteDomain, appId: string, path: string) {
++export function remoteAppAuthUrl(remote: RemoteDomain, appId: string, path: string, port?: number) {
+ 	const searchParams = new URLSearchParams({origin: 'remote', app: appId, path})
++	// Login started on an extra port host: the handoff goes back to that host.
++	if (port !== undefined) searchParams.set('port', String(port))
+ 	return `${remote.authOrigin}/app-auth?${searchParams}`
+ }
+ 
+@@ -261,23 +275,29 @@ export function isUnderBaseDomain(remote: RemoteDomain, hostname: string) {
+ 
+ // Many apps check the browser Origin against the LAN addresses Umbrel hands
+ // them (for example http://umbrel.local:3015) and reject the remote host.
+-// Others require the Origin host to equal Host or X-Forwarded-Host. For a
+-// request that arrived on an app's own remote host, the gateway presents it the
+-// way a LAN browser would send it: Host becomes the LAN host and a same-app
+-// Origin/Referer the LAN origin, together, so both kinds of check pass.
+-// X-Forwarded-Host and X-Forwarded-Proto keep the public host and https for
+-// apps that build URLs from them. Returns undefined for every other host, so
+-// LAN, IP, Tor and Tailscale requests are never touched.
++// Others require the Origin host to equal Host or X-Forwarded-Host, or Origin
++// to equal X-Forwarded-Proto://Host. For a request that arrived on an app's own
++// remote host, the gateway presents it the way a LAN browser would send it:
++// Host, X-Forwarded-Host and X-Forwarded-Proto become the LAN host and scheme,
++// and a same-app Origin/Referer the LAN origin, all together, so every such
++// check passes. lanOrigin is undefined when the app gets the request as sent
++// instead (remote Host, Origin, X-Forwarded-Host and https, all together):
++// - the owner turned the rewrite off for it (originRewriteDisabledApps), or
++// - the app runs with its own base URL on its remote origin (appUsesRemoteOrigin),
++//   so a LAN presentation would contradict its own configuration.
++// Returns undefined for every other host, so LAN, IP, Tor and Tailscale
++// requests are never touched.
+ export function remoteOriginRewrite(
+ 	remote: RemoteDomain | undefined,
+ 	appId: string,
+ 	hostHeader: string | undefined,
+ 	lanOrigin: string | undefined,
++	appUsesRemoteOrigin = false,
+ ) {
+ 	if (!remote) return
+ 	const remoteHost = appRemoteHost(remote, appId)
+ 	if (!remoteHost || normaliseHostHeader(hostHeader) !== remoteHost) return
+-	const enabled = !!lanOrigin && !remote.originRewriteDisabledApps.includes(appId)
++	const enabled = !!lanOrigin && !remote.originRewriteDisabledApps.includes(appId) && !appUsesRemoteOrigin
+ 	return {remoteHost, remoteOrigin: `https://${remoteHost}`, lanOrigin: enabled ? lanOrigin : undefined}
+ }
+ 
+diff --git a/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
+index 010935d..87d23f6 100644
+--- a/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
++++ b/packages/umbreld/source/modules/lan-ingress/remote-domain.unit.test.ts
+@@ -2,6 +2,7 @@ import {describe, expect, test} from 'vitest'
+ 
+ import {
+ 	DEFAULT_TRUSTED_PROXIES,
++	appPortRemoteHost,
+ 	appRemoteHost,
+ 	buildAppHostMap,
+ 	isRemoteAuthRequest,
+@@ -42,12 +43,29 @@ describe('remote domain settings', () => {
+ 			allowUnauthenticatedApps: [],
+ 			originRewriteDisabledApps: [],
+ 			allowPublicPathApps: [],
++			remoteAccessDisabledApps: [],
+ 			trustedProxies: DEFAULT_TRUSTED_PROXIES,
+ 			clientIpHeader: undefined,
+ 		})
+ 		expect(appRemoteHost(remote, 'nextcloud')).toBe('nextcloud-umbrel.example.com')
+ 	})
+ 
++	test('extra port hosts use <app>-<port> in the app template', () => {
++		expect(appPortRemoteHost(remote, 'lobe-chat', 7458)).toBe('lobe-chat-7458-umbrel.example.com')
++		expect(appPortRemoteHost(remote, 'lobe-chat', 0)).toBeUndefined()
++		expect(appPortRemoteHost(remote, 'lobe-chat', 70000)).toBeUndefined()
++		const url = new URL(remoteAppAuthUrl(remote, 'lobe-chat', '/x', 7458))
++		expect(url.searchParams.get('port')).toBe('7458')
++		expect(new URL(remoteAppAuthUrl(remote, 'lobe-chat', '/x')).searchParams.has('port')).toBe(false)
++	})
++
++	test('dedups the remote access opt-out list', () => {
++		expect(
++			resolveRemoteDomain({enabled: true, baseDomain: 'example.com', remoteAccessDisabledApps: ['a', 'a', 'b']})!
++				.remoteAccessDisabledApps,
++		).toEqual(['a', 'b'])
++	})
++
+ 	test('supports custom names', () => {
+ 		const custom = resolveRemoteDomain({
+ 			enabled: true,
+diff --git a/packages/umbreld/source/modules/lan-ingress/routes.ts b/packages/umbreld/source/modules/lan-ingress/routes.ts
+index 22dd95c..45e9724 100644
+--- a/packages/umbreld/source/modules/lan-ingress/routes.ts
++++ b/packages/umbreld/source/modules/lan-ingress/routes.ts
+@@ -11,6 +11,7 @@ import {
+ 	validateRemoteDomainSettings,
+ 	type RemoteDomainSettings,
+ } from './remote-domain.js'
++import {readSavedRemoteAccessAnalysis} from './remote-access-files.js'
+ 
+ const RemoteDomainSettingsSchema = z.object({
+ 	enabled: z.boolean(),
+@@ -30,6 +31,10 @@ const RemoteDomainSettingsSchema = z.object({
+ 		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
+ 		.max(500)
+ 		.optional(),
++	remoteAccessDisabledApps: z
++		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
++		.max(500)
++		.optional(),
+ 	trustedProxies: z.array(z.string().trim().max(64)).max(100).optional(),
+ 	clientIpHeader: z.string().trim().max(64).optional(),
+ })
+@@ -65,6 +70,7 @@ export default router({
+ 			allowUnauthenticatedApps: stored?.allowUnauthenticatedApps ?? [],
+ 			originRewriteDisabledApps: stored?.originRewriteDisabledApps ?? [],
+ 			allowPublicPathApps: stored?.allowPublicPathApps ?? [],
++			remoteAccessDisabledApps: stored?.remoteAccessDisabledApps ?? [],
+ 			trustedProxies: stored?.trustedProxies ?? [],
+ 			defaultTrustedProxies: DEFAULT_TRUSTED_PROXIES,
+ 			clientIpHeader: stored?.clientIpHeader ?? '',
+@@ -79,6 +85,7 @@ export default router({
+ 			allowUnauthenticatedApps: [...new Set(input.allowUnauthenticatedApps ?? [])],
+ 			originRewriteDisabledApps: [...new Set(input.originRewriteDisabledApps ?? [])],
+ 			allowPublicPathApps: [...new Set(input.allowPublicPathApps ?? [])],
++			remoteAccessDisabledApps: [...new Set(input.remoteAccessDisabledApps ?? [])],
+ 			trustedProxies: [...new Set((input.trustedProxies ?? []).filter(Boolean))],
+ 			clientIpHeader: input.clientIpHeader || undefined,
+ 		}
+@@ -96,6 +103,33 @@ export default router({
+ 			await ctx.umbreld.lanIngress.refresh().catch(() => {})
+ 			throw error
+ 		}
+-		return true
++		// Port routing follows the new settings at once. Environment rewrites
++		// are written when an app starts, so tell the owner which apps need a
++		// restart to pick up a changed remote access switch.
++		const changed = new Set(
++			[...(previous?.remoteAccessDisabledApps ?? []), ...(next.remoteAccessDisabledApps ?? [])].filter(
++				(appId) =>
++					(previous?.remoteAccessDisabledApps ?? []).includes(appId) !==
++					(next.remoteAccessDisabledApps ?? []).includes(appId),
++			),
++		)
++		return {restartRequired: [...changed]}
+ 	}),
++
++	// Owner-only. The remote access analysis for one app: what was applied at
++	// its last start (saved on disk) and what the live analysis says now.
++	// Variable names and URLs from the app's compose template only; resolved
++	// secrets are never part of the analysis.
++	getRemoteAccess: privateProcedure
++		.input(z.object({appId: z.string().regex(/^[a-zA-Z0-9-]+$/)}))
++		.query(async ({ctx, input}) => {
++			const saved = await readSavedRemoteAccessAnalysis(ctx.umbreld, input.appId)
++			return {
++				saved,
++				live: ctx.umbreld.lanIngress.remoteAccessAnalysis(input.appId),
++				routes: ctx.umbreld.lanIngress
++					.remotePortRoutes(input.appId)
++					.map(({port, origin, auth}) => ({port, origin, auth})),
++			}
++		}),
+ })
+diff --git a/packages/umbreld/source/modules/server/app-auth-remote.unit.test.ts b/packages/umbreld/source/modules/server/app-auth-remote.unit.test.ts
+index 8e888c9..aa2f9ba 100644
+--- a/packages/umbreld/source/modules/server/app-auth-remote.unit.test.ts
++++ b/packages/umbreld/source/modules/server/app-auth-remote.unit.test.ts
+@@ -17,6 +17,11 @@ function fakeUmbreld(remoteDomain: RemoteDomain | undefined, routedApps = ['next
+ 			remoteDomain,
+ 			remoteAppOrigin: (appId: string) =>
+ 				remoteDomain && routedApps.includes(appId) ? `https://${appId}-umbrel.${remoteDomain.baseDomain}` : undefined,
++			// Port 7458 is routed with Umbrel login; anything else is not.
++			remoteAppPortOrigin: (appId: string, port: number) =>
++				remoteDomain && routedApps.includes(appId) && port === 7458
++					? `https://${appId}-7458-umbrel.${remoteDomain.baseDomain}`
++					: undefined,
+ 		},
+ 		apps: {
+ 			getApp: () => ({
+@@ -68,6 +73,27 @@ describe('remote app auth requests', () => {
+ 		})
+ 	})
+ 
++	test('hands off to an extra port host when the login started there', async () => {
++		const response = await createHandoffResponse(
++			fakeUmbreld(remote),
++			fakeRequest('umbrel-auth.example.com', {...remoteQuery, port: '7458'}),
++			'gateway-token',
++		)
++		expect(response.url).toBe('https://nextcloud-7458-umbrel.example.com/umbrel_/api/v1/auth/handoff')
++		await expect(
++			appHandoffFormAction(fakeUmbreld(remote), fakeRequest('umbrel-auth.example.com', {...remoteQuery, port: '7458'})),
++		).resolves.toBe('https://nextcloud-7458-umbrel.example.com')
++		// Unknown or malformed ports fall back to the main app host.
++		for (const port of ['9999', 'abc', '7458x', '123456']) {
++			const fallback = await createHandoffResponse(
++				fakeUmbreld(remote),
++				fakeRequest('umbrel-auth.example.com', {...remoteQuery, port}),
++				'gateway-token',
++			)
++			expect(fallback.url).toBe('https://nextcloud-umbrel.example.com/umbrel_/api/v1/auth/handoff')
++		}
++	})
++
+ 	test('refuses a handoff for apps that are not routed on the remote domain', async () => {
+ 		await expect(
+ 			createHandoffResponse(
+diff --git a/packages/umbreld/source/modules/server/app-auth.ts b/packages/umbreld/source/modules/server/app-auth.ts
+index dec69be..d0fe74b 100644
+--- a/packages/umbreld/source/modules/server/app-auth.ts
++++ b/packages/umbreld/source/modules/server/app-auth.ts
+@@ -51,6 +51,13 @@ function remoteAppOriginForRequest(umbreld: Umbreld, request: express.Request) {
+ 	const appId = request.query.app
+ 	if (typeof appId !== 'string' || !/^[a-zA-Z0-9-]+$/.test(appId)) return
+ 	if (!isRemoteAuthRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return
++	// Login started on one of the app's extra port hosts: hand off to that
++	// exact host. An unknown port falls back to the main app host.
++	const port = request.query.port
++	if (typeof port === 'string' && /^\d{1,5}$/.test(port)) {
++		const portOrigin = umbreld.lanIngress.remoteAppPortOrigin(appId, Number(port))
++		if (portOrigin) return portOrigin
++	}
+ 	return umbreld.lanIngress.remoteAppOrigin(appId)
+ }
+ 
